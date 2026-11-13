@@ -1,0 +1,11 @@
+build/
+*.bak*
+*.exe
+*.obj
+*.pdb
+*.ilk
+*.lib
+*.exp
+__pycache__/
+Gitmo.log
+Gitmo.previous.log
