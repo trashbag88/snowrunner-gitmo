@@ -2,14 +2,22 @@
 
 Gitmo adds a phone to SnowRunner. You can send money to the friends you play co-op with, text them (with photos and emoji) and listen to internet radio while you drive. It works on a flat screen and in VR (with the [Snowrunner-VR](https://github.com/Timguin-87/Snowrunner-VR) mod).
 
+![Gitmo in SnowRunner: the Gitmo app with balance and recent activity](docs/screenshots/in-game-gitmo.jpg)
+
+<p>
+<img src="docs/screenshots/in-game-home.jpg" width="32%" alt="The phone's home screen in game">
+<img src="docs/screenshots/in-game-radio.jpg" width="32%" alt="The Radio app in game">
+<img src="docs/screenshots/in-game-settings.jpg" width="32%" alt="The Settings app in game">
+</p>
+
+Press **Delete** in game to open or close the phone. You can change the key on the phone.
+
 <p>
 <img src="docs/screenshots/home.png" width="190" alt="Home screen">
 <img src="docs/screenshots/send-money.png" width="190" alt="Send money">
 <img src="docs/screenshots/sms-chat.png" width="190" alt="SMS chat">
 <img src="docs/screenshots/radio-now-playing.png" width="190" alt="Radio, now playing">
 </p>
-
-Press **Delete** in game to open or close the phone. You can change the key on the phone.
 
 ## Apps
 
