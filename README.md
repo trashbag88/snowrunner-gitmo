@@ -36,7 +36,7 @@ Press **Delete** in game to open or close the phone. You can change the key on t
 
 ## Install
 
-1. Download the latest `Gitmo-v*.zip` from [Releases](../../releases) and unzip it.
+1. Download the latest `Gitmo-v*.zip` from [Releases](../../releases) or from [Nexus Mods](https://www.nexusmods.com/snowrunner/mods/78), and unzip it.
 2. Close SnowRunner and double-click **Install Gitmo.bat**. It finds the game through Steam and copies `version.dll` and `Gitmo.ini` next to `SnowRunner.exe`.
 3. Start the game and press **Delete**.
 
