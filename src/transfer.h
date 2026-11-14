@@ -25,6 +25,7 @@
 #include <vector>
 #include <map>
 #include <functional>
+#include <utility>
 
 namespace tx {
 
@@ -38,6 +39,7 @@ struct Outgoing {
     Out st = Out::Offered;
     uint64_t created = 0, changed = 0, lastSend = 0;
     int cancelsLeft = 0;         // CANCEL repeats still to send
+    bool persistPending = false; // a money change is waiting for durable transfer state
     std::string note;            // reason shown to the player (e.g. "Not in a map")
 };
 
@@ -49,6 +51,7 @@ struct Incoming {
     uint64_t created = 0, changed = 0, lastSend = 0;
     long long wall = 0;          // unix time, for keeping settled records a while
     bool seen = false;           // the player has seen how it ended
+    bool persistPending = false; // a credit is waiting for durable transfer state
     std::string why;             // how it ended when no money moved ("Bob canceled", "No answer"...)
 };
 
@@ -64,12 +67,14 @@ struct Peer {
 };
 
 struct IO {
+    // Required: send, applyMoney, balance, persist, now, newId.
+    // Optional: mayPay, ring, wallclock, log, note.
     std::function<void(uint64_t peer, const std::string& msg)> send;
-    std::function<bool(long long delta, const std::string& label)> applyMoney;   // false = couldn't (not in a map)
+    std::function<bool(long long delta, const std::string& label)> applyMoney;   // false = balance couldn't be changed
     std::function<long long()> balance;            // < 0: not known right now
     std::function<bool()> mayPay;                  // false: taking money now could let it be spent twice (the sender is in a garage)
     std::function<void()> ring;                    // a new request came in
-    std::function<void(const std::string&)> persist;
+    std::function<bool(const std::string&)> persist; // true only when the state is durable
     std::function<uint64_t()> now;                 // milliseconds, monotonic
     std::function<long long()> wallclock;          // unix seconds
     std::function<uint64_t()> newId;
@@ -120,20 +125,23 @@ public:
     // for the phone
     std::vector<Outgoing> Outs() const;
     std::vector<Incoming> Ins() const;
+    int PromptCount() const;                      // avoids copying the incoming history to count prompts
     std::vector<Peer> OnlinePeers() const;          // peers with Gitmo heard from recently (only our session's, if session-only)
     std::vector<Peer> OnlinePeersAll() const;       // the same, ignoring the session
-    const Outgoing* FindOut(uint64_t id) const;
+    const Outgoing* FindOut(uint64_t id) const;     // pointer is invalidated by the next mutating Engine call
     std::string Save() const;
 
 private:
     void SendMsg(uint64_t peer, const std::string& type, uint64_t id, long long amount, const std::string& extra = "");
     void SetOut(Outgoing& o, Out st, const std::string& note = "");
     void SetIn(Incoming& i, In st, const std::string& why = "");
+    void TryRefund(Outgoing& o);
+    void TrimIncomingHistory();
     void Note(const std::string& label, long long amount, const std::string& why) { if (io_.note) io_.note(label, amount, why); }
     Incoming* FindIn(uint64_t peer, uint64_t id);
     Outgoing* FindOutMut(uint64_t peer, uint64_t id);
     std::string NameOf(uint64_t peer) const;
-    void Persist();
+    bool Persist();
     void Logf(const char* fmt, ...) const;
 
     IO io_;

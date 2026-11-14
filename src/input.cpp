@@ -19,6 +19,9 @@
 #include "gitmo.h"
 #define DIRECTINPUT_VERSION 0x0800
 #include <dinput.h>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <string>
 #include <thread>
 #include <algorithm>
@@ -80,7 +83,7 @@ void Input_PressEscape() {
         if (g_escWant) Input_PressEscape();
     }).detach();
 }
-bool Input_IsGitmoKey(UINT m, WPARAM w, LPARAM l) { return (m == WM_KEYDOWN || m == WM_KEYUP || m == WM_CHAR) && (w == VK_ESCAPE || w == 0x1B) && (l & kGitmoKeyMark); }
+bool Input_IsGitmoKey(UINT m, WPARAM w, LPARAM l) { return (m == WM_KEYDOWN || m == WM_KEYUP || m == WM_CHAR) && w == VK_ESCAPE && (l & kGitmoKeyMark); }
 
 // clear the game's key-down table; note any key that was set
 static void ClearKeyTable() {
@@ -105,17 +108,38 @@ static SRWLOCK g_vtLock = SRWLOCK_INIT;
 
 static void* OrigFor(VtOrig* t, void* self) {
     void** vt = *(void***)self;
-    for (int i = 0; i < kMaxVt; i++) if (t[i].vt == vt) return t[i].fn;
-    for (int i = 0; i < kMaxVt; i++) if (t[i].fn) return t[i].fn;
-    return nullptr;
+    AcquireSRWLockShared(&g_vtLock);
+    void* fn = nullptr;
+    bool found = false;
+    for (int i = 0; i < kMaxVt; i++) {
+        if (t[i].vt == vt) { fn = t[i].fn; found = true; break; }
+    }
+    if (!found) for (int i = 0; i < kMaxVt; i++) {
+        if (t[i].fn) { fn = t[i].fn; break; }
+    }
+    ReleaseSRWLockShared(&g_vtLock);
+    return fn;
 }
+
+// the original GetDeviceState of a table Gitmo has patched (nullptr: not one of ours)
+static void* RegisteredOrig(void** vt) {
+    AcquireSRWLockShared(&g_vtLock);
+    void* fn = nullptr;
+    for (int i = 0; i < kMaxVt; i++) {
+        if (g_state[i].vt == vt) { fn = g_state[i].fn; break; }
+    }
+    ReleaseSRWLockShared(&g_vtLock);
+    return fn;
+}
+
+// "name.dll" of the module that holds address p, and the offset inside it
+static const char* BaseName(const char* path) { const char* s = strrchr(path, '\\'); return s ? s + 1 : path; }
 
 static std::string ModName(const void* p) {
     HMODULE m = nullptr; char path[MAX_PATH] = "?";
     GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)p, &m);
     if (m) GetModuleFileNameA(m, path, MAX_PATH);
-    const char* nm = strrchr(path, '\\') ? strrchr(path, '\\') + 1 : path;
-    char b[MAX_PATH + 32]; sprintf_s(b, "%s+0x%llX", nm, m ? (unsigned long long)((uintptr_t)p - (uintptr_t)m) : 0ull);
+    char b[MAX_PATH + 32]; sprintf_s(b, "%s+0x%llX", BaseName(path), m ? (unsigned long long)((uintptr_t)p - (uintptr_t)m) : 0ull);
     return b;
 }
 
@@ -127,7 +151,7 @@ static bool SafeToWrap(const void* fn, std::string* owner = nullptr) {
     HMODULE m = nullptr; char path[MAX_PATH] = "";
     GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)fn, &m);
     if (m) GetModuleFileNameA(m, path, MAX_PATH);
-    const char* nm = strrchr(path, '\\') ? strrchr(path, '\\') + 1 : path;
+    const char* nm = BaseName(path);
     if (owner) *owner = *nm ? nm : "unknown memory";
     return !_stricmp(nm, "dinput8.dll") || !_stricmp(nm, "gameoverlayrenderer64.dll");
 }
@@ -191,13 +215,15 @@ static HRESULT STDMETHODCALLTYPE Hk_GetDeviceData(void* self, DWORD cbObj, DIDEV
     using F = HRESULT(STDMETHODCALLTYPE*)(void*, DWORD, DIDEVICEOBJECTDATA*, DWORD*, DWORD);
     F o = (F)OrigFor(g_data, self);
     if (!o) return E_FAIL;
+    bool open = g_menuOpen;
+    DWORD readFlags = open ? flags & ~DIGDD_PEEK : flags;
     HRESULT hr;
-    { DiEnter g(self); if (g.loop) { NoteDiLoop("GetDeviceData"); return DIERR_INPUTLOST; } hr = o(self, cbObj, rgdod, inOut, flags); }
-    if (g_menuOpen && SUCCEEDED(hr) && inOut) {
+    { DiEnter g(self); if (g.loop) { NoteDiLoop("GetDeviceData"); return DIERR_INPUTLOST; } hr = o(self, cbObj, rgdod, inOut, readFlags); }
+    if (open && SUCCEEDED(hr) && inOut) {
         int kind = DevKind(self);
         if (kind == 2) {
             d_diKbdEvents += (long)*inOut;
-            if (rgdod && cbObj >= sizeof(DIDEVICEOBJECTDATA) && !(flags & DIGDD_PEEK))
+            if (rgdod && cbObj >= sizeof(DIDEVICEOBJECTDATA) && !(readFlags & DIGDD_PEEK))
                 for (DWORD i = 0; i < *inOut; i++) {
                     auto* e = (DIDEVICEOBJECTDATA*)((uint8_t*)rgdod + i * cbObj);
                     if (e->dwData & 0x80) d_diKeys.Add(e->dwOfs);
@@ -228,7 +254,13 @@ static bool PatchDeviceTable(void* dev) {
                 (!SafeToWrap(vt[9]) ? o9 : o10).c_str());
         return false;
     }
-    if (freeIdx >= 0 && vt[9] != (void*)Hk_GetDeviceState && VirtualProtect(&vt[9], 2 * sizeof(void*), PAGE_READWRITE, &old)) {
+    if (freeIdx < 0) {
+        ReleaseSRWLockExclusive(&g_vtLock);
+        static volatile LONG full = 0;
+        if (InterlockedExchange(&full, 1) == 0) Log("input: more than %d DirectInput device tables - the extra ones are not blocked", kMaxVt);
+        return false;
+    }
+    if (vt[9] != (void*)Hk_GetDeviceState && VirtualProtect(&vt[9], 2 * sizeof(void*), PAGE_READWRITE, &old)) {
         g_state[freeIdx] = { vt, vt[9] };    // GetDeviceState (the original first, so a call never finds it empty)
         g_data[freeIdx]  = { vt, vt[10] };   // GetDeviceData
         InterlockedExchangePointer(&vt[9], (void*)Hk_GetDeviceState);
@@ -250,8 +282,7 @@ static HRESULT STDMETHODCALLTYPE Hk_CreateDevice(void* self, REFGUID guid, void*
     if (SUCCEEDED(hr) && out && *out) {
         void* dev = *out;
         void** vt = *(void***)dev;
-        bool known = false;
-        for (int i = 0; i < kMaxVt; i++) if (g_state[i].vt == vt) known = true;
+        bool known = RegisteredOrig(vt) != nullptr;
         const char* what = IsEqualGUID(guid, GUID_SysKeyboard) ? "keyboard" : IsEqualGUID(guid, GUID_SysMouse) ? "mouse" : "controller";
         // only keyboards and mice: Gitmo never blocks wheels, pedals or gamepads, so their
         // tables (which the VR mod may hook too) are left exactly as they are
@@ -259,9 +290,11 @@ static HRESULT STDMETHODCALLTYPE Hk_CreateDevice(void* self, REFGUID guid, void*
         bool ok = kbm ? PatchDeviceTable(dev) : false;
         if (!kbm) known = true;   // (nothing to report as "new")
         static volatile LONG n = 0;
-        if (InterlockedIncrement(&n) <= 24)
-            Log("input: game opened a DirectInput %s (table %s, GetDeviceState %s)%s", what, ModName(vt).c_str(), ModName(vt[9]).c_str(),
+        if (InterlockedIncrement(&n) <= 24) {
+            void* orig = RegisteredOrig(vt);   // (after patching, the table itself points at Gitmo)
+            Log("input: game opened a DirectInput %s (table %s, GetDeviceState %s)%s", what, ModName(vt).c_str(), ModName(orig ? orig : vt[9]).c_str(),
                 known ? "" : ok ? " - new table, now patched" : " - new table, not patched");
+        }
     }
     return hr;
 }
@@ -307,14 +340,20 @@ static void HookDirectInput() {
         PatchDirectInputTable(dinput);   // after Gitmo's own CreateDevice calls: from now on, the game's
         dinput->Release();
     }
+    AcquireSRWLockShared(&g_vtLock);
     int tables = 0; for (auto& t : g_state) if (t.vt) tables++;
+    ReleaseSRWLockShared(&g_vtLock);
     Log("input: DirectInput mouse/keyboard blocking ready (%d device table(s); the game's own devices are checked as it opens them)", tables);
 }
 
 // Each time the phone closes: is every patched table still pointing at Gitmo?
 static void CheckDeviceTables() {
+    VtOrig state[kMaxVt];
+    AcquireSRWLockShared(&g_vtLock);
+    for (int i = 0; i < kMaxVt; i++) state[i] = g_state[i];
+    ReleaseSRWLockShared(&g_vtLock);
     for (int i = 0; i < kMaxVt; i++) {
-        void** vt = g_state[i].vt;
+        void** vt = state[i].vt;
         if (!vt) continue;
         if (vt[9] != (void*)Hk_GetDeviceState || vt[10] != (void*)Hk_GetDeviceData)
             Log("  DirectInput table %s: GetDeviceState now %s, GetDeviceData now %s (another mod hooked over Gitmo)",
@@ -372,10 +411,11 @@ using XGetState = DWORD(WINAPI*)(DWORD, XState*);
 constexpr int kXSlots = 4;
 static uintptr_t g_xSlot[kXSlots];
 static std::atomic<int> g_xSlots{0};
+static std::atomic<int> g_xRedirectedReads{0};
 static std::atomic<long> d_xReads, d_xActive;
 static std::atomic<uint32_t> d_xButtons;
 static thread_local int t_inXHook = 0;
-static void** volatile g_xCells;   // Gitmo's cells near the game (what the redirected reads now read)
+static std::atomic<void**> g_xCells{nullptr};   // Gitmo's cells near the game (what the redirected reads now read)
 
 template <int N> static DWORD WINAPI Hk_XInputGetState(DWORD user, XState* st);
 static void* const kXHooks[kXSlots] = { (void*)&Hk_XInputGetState<0>, (void*)&Hk_XInputGetState<1>, (void*)&Hk_XInputGetState<2>, (void*)&Hk_XInputGetState<3> };
@@ -451,30 +491,45 @@ static int RedirectSlotReads(uintptr_t slot, void** cell) {
     return done;
 }
 
-static void SetUpGamepadBlock() {
+// true: finished (set up, or can't be); false: the game's gamepad reads aren't in memory yet - try again later
+static bool SetUpGamepadBlock(bool lastTry) {
     uintptr_t xs[kXSlots];
     int n = Game_FindXInputSlots(xs, kXSlots);
-    if (!n) { Log("input: the game's gamepad reads not found - controllers are not blocked while the phone is open"); return; }
+    if (!n) {
+        if (lastTry) Log("input: the game's gamepad reads not found - controllers are not blocked while the phone is open");
+        return lastTry;
+    }
     void** cells = AllocNearExe();
-    if (!cells) { Log("input: no memory near the game for the gamepad block - controllers are not blocked"); return; }
+    if (!cells) {
+        if (lastTry) Log("input: no memory near the game for the gamepad block - controllers are not blocked");
+        return lastTry;
+    }
     int total = 0;
     for (int j = 0; j < n; j++) {
         g_xSlot[j] = xs[j];
         cells[j] = kXHooks[j];
         total += RedirectSlotReads(xs[j], &cells[j]);
     }
-    g_xCells = cells;
-    g_xSlots = n;
-    Log("input: %d gamepad slot(s), %d read(s) redirected - controllers are hidden from the game while the phone is open", n, total);
+    if (!total) {
+        VirtualFree(cells, 0, MEM_RELEASE);
+        if (lastTry) Log("input: gamepad slots found, but no reads could be redirected - controllers are not blocked");
+        return lastTry;
+    }
+    g_xSlots.store(n, std::memory_order_relaxed);
+    g_xRedirectedReads.store(total, std::memory_order_relaxed);
+    g_xCells.store(cells, std::memory_order_release);
+    Log("input: %d gamepad slot(s), %d read(s) redirected through Gitmo", n, total);
+    return true;
 }
 
 // ---- every frame (overlay) ------------------------------------------------------------
 void Input_Frame(bool open) {
     static bool was;
     static ULONGLONG since;
-    if (void** cells = g_xCells) {   // another mod writing over Gitmo's cell: note it once (the loop guard keeps it safe)
+    if (void** cells = g_xCells.load(std::memory_order_acquire)) {   // another mod writing over Gitmo's cell: note it once (the loop guard keeps it safe)
         static bool noted;
-        for (int j = 0; j < g_xSlots && !noted; j++)
+        int slots = g_xSlots.load(std::memory_order_acquire);
+        for (int j = 0; j < slots && !noted; j++)
             if (cells[j] != kXHooks[j]) { noted = true; Log("input: another mod replaced Gitmo's gamepad cell %d - leaving it", j); }
     }
     if (open && !was) {
@@ -492,9 +547,10 @@ void Input_Frame(bool open) {
             d_diMouseReads.load(), d_asyncKeys.Text(false).c_str(), d_stateKeys.Text(false).c_str());
         if (!g_keyTable) Log("  game key table: not found in this game version");
         else Log("  game key table: keys that reached the game's window handler anyway%s (cleared)", d_tableKeys.Text(false).c_str());
-        if (!g_xSlots) Log("  gamepad: the game's XInput reads not found");
-        else Log("  gamepad (XInput): %ld reads, %ld with buttons or sticks in use, buttons 0x%05X (all hidden from the game)",
-                 d_xReads.load(), d_xActive.load(), d_xButtons.load());
+        int slots = g_xSlots.load(std::memory_order_acquire);
+        if (!slots) Log("  gamepad: blocking unavailable (no reads redirected)");
+        else Log("  gamepad (XInput): %ld reads, %ld with buttons or sticks in use, buttons 0x%05X (%d code read(s) routed through Gitmo)",
+                 d_xReads.load(), d_xActive.load(), d_xButtons.load(), g_xRedirectedReads.load());
         CheckDeviceTables();
     }
     was = open;
@@ -511,7 +567,7 @@ static bool PointsIntoSystem(const void* p, const char* dll) {
 // The original is stored in *orig BEFORE the entry is switched, so a game thread that
 // calls through the new entry at that very moment never finds an empty pointer.
 // Returns 1 = patched now, 2 = was already ours, 3 = another mod hooked it after us
-// (left alone), 0 = not imported.
+// (left alone), 0 = not found by name, -1 = import found but it could not be made writable.
 //
 // onlyOverSystem: when re-checking later, only re-hook if the entry points back into the
 // Windows DLL (the import table was rebuilt). If another mod (e.g. the VR mod) has put
@@ -534,16 +590,28 @@ static int PatchImport(const char* dll, const char* fn, void* hook, void* volati
             void* prev = (void*)iat->u1.Function;
             if (prev == hook) return 2;
             if (onlyOverSystem && !PointsIntoSystem(prev, dll)) return 3;
+            DWORD old;
+            if (!VirtualProtect(&iat->u1.Function, sizeof(void*), PAGE_READWRITE, &old)) return -1;
             *orig = prev;                        // 1) remember the original
             MemoryBarrier();
-            DWORD old;
-            if (!VirtualProtect(&iat->u1.Function, sizeof(void*), PAGE_READWRITE, &old)) return 0;
             InterlockedExchangePointer((void**)&iat->u1.Function, hook);   // 2) then switch, in one step
             VirtualProtect(&iat->u1.Function, sizeof(void*), old, &old);
             return 1;
         }
     }
     return 0;
+}
+
+static int g_keyImport[2];   // initial PatchImport result for the game's key imports
+
+static const char* KeyImportStatus(int result) {
+    switch (result) {
+    case -1: return "import found, patch failed";
+    case 1: return "hooked";
+    case 2: return "already hooked";
+    case 3: return "another mod's hook left in front";
+    default: return "not found by name";
+    }
 }
 
 static void PatchKeyImports(bool first) {
@@ -555,28 +623,44 @@ static void PatchKeyImports(bool first) {
         { "GetKeyState",      (void*)Hk_GetKeyState,      (void* volatile*)&o_GetKeyState } };
     for (int i = 0; i < 2; i++) {
         int r = PatchImport("USER32.dll", k[i].fn, k[i].hook, k[i].orig, !first);
-        if (r == 1 && !first) Log("input: %s hook re-applied (import table was reset)", k[i].fn);
+        if (first) g_keyImport[i] = r;
+        if (r == 1 && !first) {
+            if (g_keyImport[i] == 1 || g_keyImport[i] == 2)
+                Log("input: %s hook re-applied (import table was reset)", k[i].fn);
+            else
+                Log("input: %s hook installed on retry", k[i].fn);
+        }
         if (r == 3 && !noted[i]) { noted[i] = true; Log("input: %s is now hooked by another mod too - leaving its hook in front of ours", k[i].fn); }
     }
+}
+
+// For the first minute: re-checks the key imports every 5 s, and (once the game's code is
+// unpacked in memory) finds the key table and the gamepad reads, trying again until they are found.
+static DWORD WINAPI WatchThread(LPVOID) {
+    bool tableDone = false, padDone = false;
+    for (int i = 0; i < 12; i++) {
+        Sleep(5000);
+        PatchKeyImports(false);
+        if (i < 1) continue;
+        bool last = i == 11;
+        if (!tableDone) {
+            uintptr_t t = Game_FindKeyTable();
+            if (t) {
+                g_keyTable = (uint8_t*)t;
+                tableDone = true;
+                Log("input: the game's key table found at exe+0x%llX (cleared while the phone is open)", (unsigned long long)(t - g_exeBase));
+            } else if (last) Log("input: the game's key table not found (another game version?) - window keys are still blocked");
+        }
+        if (!padDone) padDone = SetUpGamepadBlock(last);
+    }
+    return 0;
 }
 
 void Input_Start() {
     HookDirectInput();
     PatchKeyImports(true);
-    Log("input: game key checks %s / %s", o_GetAsyncKeyState ? "GetAsyncKeyState hooked" : "GetAsyncKeyState not imported",
-        o_GetKeyState ? "GetKeyState hooked" : "GetKeyState not imported");
-    if (HANDLE t = CreateThread(nullptr, 0, [](LPVOID) -> DWORD {
-            for (int i = 0; i < 12; i++) {
-                Sleep(5000);
-                PatchKeyImports(false);
-                if (i == 1) {   // by now the game's code is unpacked in memory
-                    uintptr_t t = Game_FindKeyTable();
-                    g_keyTable = (uint8_t*)t;
-                    if (t) Log("input: the game's key table found at exe+0x%llX (cleared while the phone is open)", (unsigned long long)(t - g_exeBase));
-                    else Log("input: the game's key table not found (another game version?) - window keys are still blocked");
-                    SetUpGamepadBlock();
-                }
-            }
-            return 0;
-        }, nullptr, 0, nullptr)) CloseHandle(t);
+    Log("input: game key checks GetAsyncKeyState: %s; GetKeyState: %s",
+        KeyImportStatus(g_keyImport[0]), KeyImportStatus(g_keyImport[1]));
+    if (HANDLE t = CreateThread(nullptr, 0, WatchThread, nullptr, 0, nullptr)) CloseHandle(t);
+    else Log("input: couldn't start the watcher thread (error %lu); delayed key-table and gamepad discovery is unavailable", GetLastError());
 }

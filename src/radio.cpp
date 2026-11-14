@@ -6,12 +6,13 @@
 //     -> Windows' own decoder (Media Foundation MFT) -> 16-bit PCM
 //     -> waveOut on the default output device (so in VR it reaches the headset too)
 //
-// Each Play starts a fresh session with its own two threads (reader + player); Stop or a
-// new Play just tells the old one to finish, so nothing ever waits on the network.
+// Each Play starts a fresh session with its own reader and player threads. Stop or a
+// new Play cancels the old request and signals the player without joining either thread.
 // The radio's volume is applied to the samples, so the game's own volume is untouched.
 // Stations are kept in Gitmo-radio.ini next to the DLL.
 
 #include "gitmo.h"
+#include "shared.h"
 #include <winhttp.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -24,9 +25,16 @@
 #include <memory>
 #include <thread>
 #include <map>
+#include <set>
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <new>
+#include <exception>
+#include <system_error>
+#include <cerrno>
+#include <climits>
+#include <cstdlib>
 
 #pragma comment(lib, "winhttp.lib")
 #pragma comment(lib, "ws2_32.lib")
@@ -39,21 +47,33 @@ static const wchar_t* kAgent = L"Gitmo/" _CRT_WIDE(GITMO_VERSION) L" (SnowRunner
 
 // ---- small helpers -------------------------------------------------------------------
 static std::wstring Wide(const std::string& s) {
-    if (s.empty()) return {};
+    if (s.empty() || s.size() > INT_MAX) return {};
     int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), nullptr, 0);
-    std::wstring w(n, 0); MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), &w[0], n);
+    if (n <= 0) return {};
+    std::wstring w((size_t)n, 0);
+    int written = MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), w.data(), n);
+    if (written <= 0) return {};
+    w.resize((size_t)written);
     return w;
 }
 static std::string Utf8(const std::wstring& w) {
-    if (w.empty()) return {};
+    if (w.empty() || w.size() > INT_MAX) return {};
     int n = WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(), nullptr, 0, nullptr, nullptr);
-    std::string s(n, 0); WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(), &s[0], n, nullptr, nullptr);
+    if (n <= 0) return {};
+    std::string s((size_t)n, 0);
+    int written = WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(), s.data(), n, nullptr, nullptr);
+    if (written <= 0) return {};
+    s.resize((size_t)written);
     return s;
 }
 static std::string Lower(std::string s) { for (auto& c : s) c = (char)tolower((unsigned char)c); return s; }
-static std::string Trim(const std::string& s) {
-    size_t a = s.find_first_not_of(" \t\r\n"), b = s.find_last_not_of(" \t\r\n");
-    return a == std::string::npos ? std::string() : s.substr(a, b - a + 1);
+static int ParseInt(const std::string& s, int fallback = 0) {
+    if (s.empty()) return fallback;
+    errno = 0;
+    char* end = nullptr;
+    long value = strtol(s.c_str(), &end, 10);
+    if (errno == ERANGE || end == s.c_str() || *end || value < INT_MIN || value > INT_MAX) return fallback;
+    return (int)value;
 }
 // Latin-1 text (old servers' headers and titles) to UTF-8; valid UTF-8 is left alone
 static std::string FixText(const std::string& s) {
@@ -69,49 +89,101 @@ public:
     ~Http() { Close(); }
     // Opens url (following redirects); false + err on failure
     bool Open(const std::string& url, bool icy, std::string& err) {
+        if (url.empty() || url.size() > 8192 ||
+            std::any_of(url.begin(), url.end(), [](unsigned char c) { return c <= 0x20 || c == 0x7f; })) {
+            err = "That web link is invalid or too long";
+            return false;
+        }
         std::string u = url;
         for (int hop = 0; hop < 6; hop++) {
             Close();
             int r = OpenWinHttp(u, icy, err);
             if (r == 2) r = OpenSocket(u, icy, err);   // the server answered in a way WinHTTP won't accept
-            if (r == 3) { u = location_; continue; }   // (socket) redirect
+            if (r == 3) {
+                u = ResolveRedirect(u, location_);
+                if (u.empty()) { err = "The server sent an invalid redirect"; return false; }
+                continue;
+            }
             return r == 1;
         }
         err = "Too many redirects";
         return false;
     }
+    void Cancel() {
+        cancelled_ = true;
+        HINTERNET req = req_.exchange(nullptr);
+        if (req) WinHttpCloseHandle(req);
+        SOCKET sock = sock_.load();
+        if (sock != INVALID_SOCKET) shutdown(sock, SD_BOTH);
+    }
     int Read(uint8_t* buf, int n) {   // >0 bytes, 0 end of stream, -1 error
+        if (cancelled_) return -1;
         if (pre_.size()) { int k = std::min<int>(n, (int)pre_.size()); memcpy(buf, pre_.data(), k); pre_.erase(0, k); return k; }
-        if (req_) {
+        HINTERNET req = req_.load();
+        if (req) {
             DWORD avail = 0;
-            if (!WinHttpQueryDataAvailable(req_, &avail)) return -1;
+            if (!WinHttpQueryDataAvailable(req, &avail)) return -1;
             if (avail == 0) return 0;
             DWORD got = 0;
-            if (!WinHttpReadData(req_, buf, std::min<DWORD>(avail, (DWORD)n), &got)) return -1;
+            if (!WinHttpReadData(req, buf, std::min<DWORD>(avail, (DWORD)n), &got)) return -1;
             return (int)got;
         }
-        if (sock_ != INVALID_SOCKET) { int k = recv(sock_, (char*)buf, n, 0); return k < 0 ? -1 : k; }
+        SOCKET sock = sock_.load();
+        if (sock != INVALID_SOCKET) { int k = recv(sock, (char*)buf, n, 0); return k < 0 ? -1 : k; }
         return -1;
     }
     std::string Header(const std::string& name) const { auto it = hdr_.find(Lower(name)); return it == hdr_.end() ? std::string() : it->second; }
     bool ReadAll(std::string& out, size_t max) {
         uint8_t b[16384];
-        for (;;) { int k = Read(b, sizeof b); if (k < 0) return false; if (k == 0) return true; out.append((char*)b, k); if (out.size() > max) return true; }
+        for (;;) {
+            int k = Read(b, sizeof b);
+            if (k < 0) return false;
+            if (k == 0) return true;
+            if ((size_t)k > max - std::min(max, out.size())) { out.clear(); return false; }
+            out.append((char*)b, (size_t)k);
+        }
     }
     void Close() {
-        if (req_) WinHttpCloseHandle(req_); if (con_) WinHttpCloseHandle(con_); if (ses_) WinHttpCloseHandle(ses_);
-        req_ = con_ = ses_ = nullptr;
-        if (sock_ != INVALID_SOCKET) { closesocket(sock_); sock_ = INVALID_SOCKET; }
+        HINTERNET req = req_.exchange(nullptr);
+        if (req) WinHttpCloseHandle(req);
+        if (con_) WinHttpCloseHandle(con_);
+        if (ses_) WinHttpCloseHandle(ses_);
+        con_ = ses_ = nullptr;
+        SOCKET sock = sock_.exchange(INVALID_SOCKET);
+        if (sock != INVALID_SOCKET) { shutdown(sock, SD_BOTH); closesocket(sock); }
         hdr_.clear(); pre_.clear();
     }
 private:
-    HINTERNET ses_ = nullptr, con_ = nullptr, req_ = nullptr;
-    SOCKET sock_ = INVALID_SOCKET;
+    HINTERNET ses_ = nullptr, con_ = nullptr;
+    std::atomic<HINTERNET> req_{nullptr};
+    std::atomic<SOCKET> sock_{INVALID_SOCKET};
+    std::atomic<bool> cancelled_{false};
     std::map<std::string, std::string> hdr_;
     std::string pre_, location_;
 
+    static std::string ResolveRedirect(const std::string& base, const std::string& location) {
+        if (location.empty()) return {};
+        std::string locationPrefix = Lower(location.substr(0, std::min<size_t>(8, location.size())));
+        if (locationPrefix.compare(0, 7, "http://") == 0 || locationPrefix.compare(0, 8, "https://") == 0) return location;
+        size_t scheme = base.find("://");
+        if (scheme == std::string::npos) return {};
+        std::string origin = base.substr(0, scheme + 3);
+        size_t pathStart = base.find_first_of("/?#", scheme + 3);
+        if (pathStart == std::string::npos) return location[0] == '/' ? origin + location : origin + "/" + location;
+        origin = base.substr(0, pathStart);
+        if (location.compare(0, 2, "//") == 0) return base.substr(0, scheme + 1) + location;
+        if (location[0] == '/') return origin + location;
+        std::string path = base.substr(pathStart);
+        size_t suffix = path.find_first_of("?#");
+        if (suffix != std::string::npos) path.resize(suffix);
+        if (location[0] == '?') return origin + (path.empty() ? "/" : path) + location;
+        size_t slash = path.find_last_of('/');
+        return origin + (slash == std::string::npos ? "/" : path.substr(0, slash + 1)) + location;
+    }
+
     // 1 ok, 0 failed, 2 try the socket
     int OpenWinHttp(const std::string& url, bool icy, std::string& err) {
+        if (cancelled_) { err = "Connection cancelled"; return 0; }
         std::wstring w = Wide(url);
         URL_COMPONENTS uc{}; uc.dwStructSize = sizeof uc;
         wchar_t host[256], path[2048], extra[2048];
@@ -124,10 +196,12 @@ private:
         con_ = WinHttpConnect(ses_, host, uc.nPort, 0);
         std::wstring pq = std::wstring(path) + extra;
         if (pq.empty()) pq = L"/";
-        if (con_) req_ = WinHttpOpenRequest(con_, L"GET", pq.c_str(), nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, uc.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0);
-        if (!req_) { err = "Couldn't reach the server"; return 0; }
+        HINTERNET req = con_ ? WinHttpOpenRequest(con_, L"GET", pq.c_str(), nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, uc.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0) : nullptr;
+        req_ = req;
+        if (!req) { err = "Couldn't reach the server"; return 0; }
+        if (cancelled_) { Cancel(); err = "Connection cancelled"; return 0; }
         const wchar_t* hdrs = icy ? L"Icy-MetaData: 1\r\n" : L"Accept: application/json\r\n";
-        if (!WinHttpSendRequest(req_, hdrs, (DWORD)-1, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) || !WinHttpReceiveResponse(req_, nullptr)) {
+        if (!WinHttpSendRequest(req, hdrs, (DWORD)-1, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) || !WinHttpReceiveResponse(req, nullptr)) {
             DWORD e = GetLastError();
             if (e == ERROR_WINHTTP_INVALID_SERVER_RESPONSE && uc.nScheme == INTERNET_SCHEME_HTTP) return 2;
             err = e == ERROR_WINHTTP_NAME_NOT_RESOLVED ? "Server not found" : e == ERROR_WINHTTP_TIMEOUT ? "The server didn't answer" :
@@ -136,13 +210,13 @@ private:
             return 0;
         }
         DWORD code = 0, sz = sizeof code;
-        WinHttpQueryHeaders(req_, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &code, &sz, WINHTTP_NO_HEADER_INDEX);
+        WinHttpQueryHeaders(req, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &code, &sz, WINHTTP_NO_HEADER_INDEX);
         // all headers, raw, into the map
         sz = 0;
-        WinHttpQueryHeaders(req_, WINHTTP_QUERY_RAW_HEADERS_CRLF, WINHTTP_HEADER_NAME_BY_INDEX, nullptr, &sz, WINHTTP_NO_HEADER_INDEX);
+        WinHttpQueryHeaders(req, WINHTTP_QUERY_RAW_HEADERS_CRLF, WINHTTP_HEADER_NAME_BY_INDEX, nullptr, &sz, WINHTTP_NO_HEADER_INDEX);
         if (sz) {
             std::wstring raw(sz / 2 + 1, 0);
-            if (WinHttpQueryHeaders(req_, WINHTTP_QUERY_RAW_HEADERS_CRLF, WINHTTP_HEADER_NAME_BY_INDEX, &raw[0], &sz, WINHTTP_NO_HEADER_INDEX)) ParseHeaders(Utf8(raw.c_str()));
+            if (WinHttpQueryHeaders(req, WINHTTP_QUERY_RAW_HEADERS_CRLF, WINHTTP_HEADER_NAME_BY_INDEX, &raw[0], &sz, WINHTTP_NO_HEADER_INDEX)) ParseHeaders(Utf8(raw.c_str()));
         }
         if (code != 200) { err = code == 404 ? "Station not found at that link (404)" : "The server said " + std::to_string(code); return 0; }
         return 1;
@@ -154,7 +228,7 @@ private:
             size_t e = raw.find("\r\n", p); if (e == std::string::npos) e = raw.size();
             std::string line = raw.substr(p, e - p);
             size_t c = line.find(':');
-            if (c != std::string::npos) hdr_[Lower(Trim(line.substr(0, c)))] = FixText(Trim(line.substr(c + 1)));
+            if (c != std::string::npos) hdr_[Lower(gitmo_shared::TrimAsciiWhitespace(line.substr(0, c)))] = FixText(gitmo_shared::TrimAsciiWhitespace(line.substr(c + 1)));
             p = e + 2;
         }
     }
@@ -164,29 +238,57 @@ private:
         Close();
         static bool wsa = [] { WSADATA d; return WSAStartup(MAKEWORD(2, 2), &d) == 0; }();
         if (!wsa) { err = "Couldn't start networking"; return 0; }
+        if (url.compare(0, 7, "http://") != 0) { err = "The socket fallback only supports http links"; return 0; }
         std::string rest = url.substr(7);   // after http://
-        size_t sl = rest.find('/');
-        std::string hostport = rest.substr(0, sl), path = sl == std::string::npos ? "/" : rest.substr(sl);
-        std::string host = hostport, port = "80";
-        size_t col = hostport.rfind(':');
-        if (col != std::string::npos && hostport.find(']') == std::string::npos) { host = hostport.substr(0, col); port = hostport.substr(col + 1); }
+        size_t sl = rest.find_first_of("/?#");
+        std::string hostport = rest.substr(0, sl);
+        std::string path = sl == std::string::npos ? "/" : rest.substr(sl);
+        if (path[0] == '?') path.insert(path.begin(), '/');
+        size_t fragment = path.find('#');
+        if (fragment != std::string::npos) path.resize(fragment);
+        if (path.empty()) path = "/";
+        if (hostport.empty()) { err = "That isn't a web link"; return 0; }
+        std::string host, port = "80";
+        if (hostport[0] == '[') {
+            size_t close = hostport.find(']');
+            if (close == std::string::npos) { err = "That isn't a web link"; return 0; }
+            host = hostport.substr(1, close - 1);
+            if (close + 1 < hostport.size()) {
+                if (hostport[close + 1] != ':') { err = "That isn't a web link"; return 0; }
+                port = hostport.substr(close + 2);
+            }
+        } else {
+            size_t col = hostport.rfind(':');
+            if (col != std::string::npos) { host = hostport.substr(0, col); port = hostport.substr(col + 1); }
+            else host = hostport;
+        }
+        int portNumber = ParseInt(port, -1);
+        if (host.empty() || portNumber < 1 || portNumber > 65535) { err = "That isn't a web link"; return 0; }
         addrinfo hints{}, *res = nullptr; hints.ai_socktype = SOCK_STREAM;
         if (getaddrinfo(host.c_str(), port.c_str(), &hints, &res) != 0 || !res) { err = "Server not found"; return 0; }
         for (addrinfo* a = res; a; a = a->ai_next) {
-            sock_ = socket(a->ai_family, a->ai_socktype, a->ai_protocol);
-            if (sock_ == INVALID_SOCKET) continue;
-            DWORD to = 15000; setsockopt(sock_, SOL_SOCKET, SO_RCVTIMEO, (char*)&to, sizeof to);
-            if (connect(sock_, a->ai_addr, (int)a->ai_addrlen) == 0) break;
-            closesocket(sock_); sock_ = INVALID_SOCKET;
+            SOCKET sock = socket(a->ai_family, a->ai_socktype, a->ai_protocol);
+            if (sock == INVALID_SOCKET) continue;
+            sock_ = sock;
+            DWORD to = 15000; setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (char*)&to, sizeof to);
+            if (!cancelled_ && connect(sock, a->ai_addr, (int)a->ai_addrlen) == 0) break;
+            SOCKET owned = sock_.exchange(INVALID_SOCKET);
+            if (owned != INVALID_SOCKET) closesocket(owned);
         }
         freeaddrinfo(res);
-        if (sock_ == INVALID_SOCKET) { err = "Couldn't connect to the server"; return 0; }
+        SOCKET sock = sock_.load();
+        if (sock == INVALID_SOCKET || cancelled_) { err = "Couldn't connect to the server"; return 0; }
         std::string rq = "GET " + path + " HTTP/1.0\r\nHost: " + hostport + "\r\nUser-Agent: " + Utf8(kAgent) + "\r\n" + (icy ? "Icy-MetaData: 1\r\n" : "") + "Connection: close\r\n\r\n";
-        send(sock_, rq.data(), (int)rq.size(), 0);
+        size_t sent = 0;
+        while (sent < rq.size()) {
+            int n = send(sock, rq.data() + sent, (int)std::min<size_t>(rq.size() - sent, INT_MAX), 0);
+            if (n <= 0) { err = "Couldn't send the station request"; return 0; }
+            sent += (size_t)n;
+        }
         std::string head;
         char b[4096];
         while (head.find("\r\n\r\n") == std::string::npos && head.find("\n\n") == std::string::npos) {
-            int k = recv(sock_, b, sizeof b, 0);
+            int k = recv(sock, b, sizeof b, 0);
             if (k <= 0) { err = "The server closed the connection"; return 0; }
             head.append(b, k);
             if (head.size() > 65536) { err = "The server's answer wasn't understood"; return 0; }
@@ -200,7 +302,9 @@ private:
         ParseHeaders(le == std::string::npos ? "" : hs.substr(le + 1));
         int code = 0;
         size_t sp = status.find(' ');
-        if (sp != std::string::npos) code = atoi(status.c_str() + sp + 1);
+        size_t codeEnd = sp == std::string::npos ? std::string::npos : status.find(' ', sp + 1);
+        if (sp != std::string::npos)
+            code = ParseInt(status.substr(sp + 1, codeEnd == std::string::npos ? std::string::npos : codeEnd - sp - 1));
         if ((code == 301 || code == 302 || code == 303 || code == 307 || code == 308) && !Header("location").empty()) { location_ = Header("location"); return 3; }
         if (code != 200) { err = "The server said " + std::to_string(code); return 0; }
         return 1;
@@ -215,20 +319,47 @@ static std::atomic<unsigned> g_stVersion{1};
 
 static std::wstring StationsPath() { return ModuleDir() + L"\\Gitmo-radio.ini"; }
 
-static void SaveStations() {   // with g_stMx held
+static bool SaveStations() {   // with g_stMx held
     std::string out = "; Gitmo radio - your stations, in the order the phone shows them.\r\n"
                       "; One per line:  Name | Stream link | Genre\r\n"
                       "; (Edited on the phone; you can also edit this file while the game is closed.)\r\n"
                       "[Radio]\r\nVolume=" + std::to_string(g_volume.load()) + "\r\n\r\n[Stations]\r\n";
     for (auto& st : g_stations) {
-        auto clean = [](std::string v) { for (auto& c : v) if (c == '|' || c == '\r' || c == '\n') c = ' '; return Trim(v); };
+        auto clean = [](std::string v) { for (auto& c : v) if (c == '|' || c == '\r' || c == '\n') c = ' '; return gitmo_shared::TrimAsciiWhitespace(v); };
         out += clean(st.name) + " | " + clean(st.url) + " | " + clean(st.genre) + "\r\n";
     }
-    std::wstring tmp = StationsPath() + L".tmp";
+    if (out.size() > MAXDWORD) { Log("radio: station list is too large to save"); return false; }
+    const std::wstring path = StationsPath();
+    const std::wstring tmp = path + L".tmp";
     HANDLE h = CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
-    if (h == INVALID_HANDLE_VALUE) { Log("radio: couldn't write Gitmo-radio.ini (error %lu)", GetLastError()); return; }
-    DWORD w = 0; WriteFile(h, out.data(), (DWORD)out.size(), &w, nullptr); CloseHandle(h);
-    MoveFileExW(tmp.c_str(), StationsPath().c_str(), MOVEFILE_REPLACE_EXISTING);
+    if (h == INVALID_HANDLE_VALUE) { Log("radio: couldn't write Gitmo-radio.ini (error %lu)", GetLastError()); return false; }
+    size_t off = 0;
+    bool ok = true;
+    DWORD error = ERROR_SUCCESS;
+    while (off < out.size()) {
+        DWORD written = 0;
+        DWORD chunk = (DWORD)std::min<size_t>(out.size() - off, MAXDWORD);
+        if (!WriteFile(h, out.data() + off, chunk, &written, nullptr) || !written) {
+            ok = false; error = GetLastError();
+            if (!error) error = ERROR_WRITE_FAULT;
+            break;
+        }
+        off += written;
+    }
+    if (ok && !FlushFileBuffers(h)) { ok = false; error = GetLastError(); }
+    if (!CloseHandle(h) && ok) { ok = false; error = GetLastError(); }
+    if (!ok) {
+        DeleteFileW(tmp.c_str());
+        Log("radio: couldn't finish writing Gitmo-radio.ini (error %lu)", error);
+        return false;
+    }
+    if (!MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        error = GetLastError();
+        DeleteFileW(tmp.c_str());
+        Log("radio: couldn't replace Gitmo-radio.ini (error %lu)", error);
+        return false;
+    }
+    return true;
 }
 
 static void LoadStations() {
@@ -240,22 +371,23 @@ static void LoadStations() {
     size_t p = 0;
     while (p < text.size()) {
         size_t e = text.find('\n', p); if (e == std::string::npos) e = text.size();
-        std::string line = Trim(text.substr(p, e - p));
+        std::string line = gitmo_shared::TrimAsciiWhitespace(text.substr(p, e - p));
         p = e + 1;
         if (line.empty() || line[0] == ';' || line[0] == '#') continue;
         if (line[0] == '[') { sec = Lower(line); continue; }
         if (sec == "[radio]") {
-            if (Lower(line).rfind("volume=", 0) == 0) g_volume = std::min(100, std::max(0, atoi(line.c_str() + 7)));
+            if (Lower(line).rfind("volume=", 0) == 0) g_volume = std::min(100, std::max(0, ParseInt(line.substr(7))));
             continue;
         }
+        if (!sec.empty() && sec != "[stations]") continue;
         RadioStation st;
         size_t a = line.find('|');
         if (a == std::string::npos) { st.url = line; }
         else {
-            st.name = Trim(line.substr(0, a));
+            st.name = gitmo_shared::TrimAsciiWhitespace(line.substr(0, a));
             size_t b = line.find('|', a + 1);
-            st.url = Trim(line.substr(a + 1, b == std::string::npos ? std::string::npos : b - a - 1));
-            if (b != std::string::npos) st.genre = Trim(line.substr(b + 1));
+            st.url = gitmo_shared::TrimAsciiWhitespace(line.substr(a + 1, b == std::string::npos ? std::string::npos : b - a - 1));
+            if (b != std::string::npos) st.genre = gitmo_shared::TrimAsciiWhitespace(line.substr(b + 1));
         }
         if (st.url.empty()) continue;
         if (st.name.empty()) st.name = st.url;
@@ -267,11 +399,14 @@ static void LoadStations() {
 
 std::vector<RadioStation> Radio_Stations() { std::lock_guard<std::mutex> lk(g_stMx); return g_stations; }
 unsigned Radio_StationsVersion() { return g_stVersion; }
-void Radio_SetStations(const std::vector<RadioStation>& list) {
+bool Radio_SetStations(const std::vector<RadioStation>& list) {
     std::lock_guard<std::mutex> lk(g_stMx);
+    std::vector<RadioStation> previous = g_stations;
     g_stations = list;
+    bool saved = SaveStations();
+    if (!saved) g_stations.swap(previous);
     g_stVersion++;
-    SaveStations();
+    return saved;
 }
 int Radio_Volume() { return g_volume; }
 void Radio_SetVolume(int v, bool save) {
@@ -284,12 +419,62 @@ struct Session {
     unsigned gen = 0;
     RadioStation st;
     std::atomic<bool> stop{false};
+    std::mutex httpMx;
+    Http* activeHttp = nullptr;
     std::mutex mx;
     struct Chunk { int rate, ch; std::vector<int16_t> s; size_t pos = 0; };
     std::deque<Chunk> q;          // decoded audio waiting for the speakers
-    size_t qFrames = 0;           // frames in q (at the front chunk's rate)
-    int qRate = 44100;
+    uint64_t qDuration = 0;       // buffered audio duration in 100-ns units
     std::atomic<bool> readerDone{false};
+
+    void CancelNetwork() {
+        std::lock_guard<std::mutex> lk(httpMx);
+        if (activeHttp) activeHttp->Cancel();
+    }
+};
+
+struct HttpBinding {
+    Session& session;
+    HttpBinding(Session& s, Http& h) : session(s) {
+        std::lock_guard<std::mutex> lk(session.httpMx);
+        session.activeHttp = &h;
+        if (session.stop) h.Cancel();
+    }
+    ~HttpBinding() {
+        std::lock_guard<std::mutex> lk(session.httpMx);
+        session.activeHttp = nullptr;
+    }
+};
+
+struct MfContext {
+    bool uninitialize = false;
+    bool started = false;
+    ~MfContext() {
+        if (started) MFShutdown();
+        if (uninitialize) CoUninitialize();
+    }
+    bool Start(std::string& err) {
+        HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        if (SUCCEEDED(hr)) uninitialize = true;
+        else if (hr != RPC_E_CHANGED_MODE) {
+            err = "Couldn't initialize the audio thread";
+            Log("radio: CoInitializeEx failed (0x%08lX)", hr);
+            return false;
+        }
+        hr = MFStartup(MF_VERSION, MFSTARTUP_LITE);
+        if (FAILED(hr)) {
+            err = "Couldn't start Windows audio support";
+            Log("radio: MFStartup failed (0x%08lX)", hr);
+            return false;
+        }
+        started = true;
+        return true;
+    }
+};
+
+struct ReaderDone {
+    std::shared_ptr<Session> session;
+    ~ReaderDone() { session->readerDone = true; }
 };
 
 static std::mutex g_mx;            // guards everything below
@@ -310,6 +495,23 @@ RadioState Radio_State() { std::lock_guard<std::mutex> lk(g_mx); RadioState s = 
 // ---- frames in the byte stream ------------------------------------------------------------
 enum Codec { CNone, CMp3, CAac };
 struct FrameInfo { int len = 0, rate = 0, ch = 0, kbps = 0, samples = 0; };
+
+template<class T>
+class MfOwner {
+public:
+    MfOwner() = default;
+    MfOwner(const MfOwner&) = delete;
+    MfOwner& operator=(const MfOwner&) = delete;
+    ~MfOwner() { Reset(); }
+    T** Put() { Reset(); return &p_; }
+    T* Get() const { return p_; }
+    T* operator->() const { return p_; }
+    void Attach(T* p) { Reset(); p_ = p; }
+    T* Detach() { T* p = p_; p_ = nullptr; return p; }
+    void Reset() { if (p_) { p_->Release(); p_ = nullptr; } }
+private:
+    T* p_ = nullptr;
+};
 
 static bool Mp3Header(const uint8_t* p, FrameInfo& f) {
     if (p[0] != 0xFF || (p[1] & 0xE0) != 0xE0) return false;
@@ -348,52 +550,80 @@ public:
         codec_ = c;
         MFT_REGISTER_TYPE_INFO in = { MFMediaType_Audio, c == CMp3 ? MFAudioFormat_MP3 : MFAudioFormat_AAC };
         IMFActivate** acts = nullptr; UINT32 n = 0;
-        MFTEnumEx(MFT_CATEGORY_AUDIO_DECODER, MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_LOCALMFT | MFT_ENUM_FLAG_SORTANDFILTER, &in, nullptr, &acts, &n);
-        for (UINT32 i = 0; i < n; i++) { if (!mft_) acts[i]->ActivateObject(IID_PPV_ARGS(&mft_)); acts[i]->Release(); }
+        HRESULT hr = MFTEnumEx(MFT_CATEGORY_AUDIO_DECODER, MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_LOCALMFT | MFT_ENUM_FLAG_SORTANDFILTER, &in, nullptr, &acts, &n);
+        if (FAILED(hr) || (!acts && n)) {
+            if (acts) for (UINT32 i = 0; i < n; i++) if (acts[i]) acts[i]->Release();
+            CoTaskMemFree(acts);
+            err = "Windows couldn't find an audio decoder";
+            return false;
+        }
+        for (UINT32 i = 0; i < n; i++) {
+            if (acts[i]) {
+                if (!mft_) acts[i]->ActivateObject(IID_PPV_ARGS(&mft_));
+                acts[i]->Release();
+            }
+        }
         CoTaskMemFree(acts);
         if (!mft_) { err = "Windows has no decoder for this station's format"; return false; }
-        IMFMediaType* t = nullptr;
-        MFCreateMediaType(&t);
-        HRESULT hr;
+        MfOwner<IMFMediaType> t;
+        hr = MFCreateMediaType(t.Put());
+        if (FAILED(hr) || !t.Get()) { err = "Couldn't prepare the audio decoder"; Close(); return false; }
         if (c == CMp3) {
             MPEGLAYER3WAVEFORMAT wf{};
             wf.wfx.wFormatTag = WAVE_FORMAT_MPEGLAYER3; wf.wfx.nChannels = (WORD)f.ch; wf.wfx.nSamplesPerSec = f.rate;
             wf.wfx.nAvgBytesPerSec = f.kbps * 125; wf.wfx.nBlockAlign = 1; wf.wfx.cbSize = MPEGLAYER3_WFX_EXTRA_BYTES;
             wf.wID = MPEGLAYER3_ID_MPEG; wf.fdwFlags = MPEGLAYER3_FLAG_PADDING_ISO; wf.nBlockSize = (WORD)f.len; wf.nFramesPerBlock = 1; wf.nCodecDelay = 1393;
-            hr = MFInitMediaTypeFromWaveFormatEx(t, &wf.wfx, sizeof wf);
+            hr = MFInitMediaTypeFromWaveFormatEx(t.Get(), &wf.wfx, sizeof wf);
         } else {
-            t->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
-            t->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_AAC);
-            t->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, f.ch);
-            t->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, f.rate);
-            t->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, 16);
-            t->SetUINT32(MF_MT_AAC_PAYLOAD_TYPE, 1);   // ADTS
-            t->SetUINT32(MF_MT_AAC_AUDIO_PROFILE_LEVEL_INDICATION, 0xFE);
+            hr = t->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
+            if (SUCCEEDED(hr)) hr = t->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_AAC);
+            if (SUCCEEDED(hr)) hr = t->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, f.ch);
+            if (SUCCEEDED(hr)) hr = t->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, f.rate);
+            if (SUCCEEDED(hr)) hr = t->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, 16);
+            if (SUCCEEDED(hr)) hr = t->SetUINT32(MF_MT_AAC_PAYLOAD_TYPE, 1);   // ADTS
+            if (SUCCEEDED(hr)) hr = t->SetUINT32(MF_MT_AAC_AUDIO_PROFILE_LEVEL_INDICATION, 0xFE);
             const uint8_t ud[12] = { 1, 0, 0xFE, 0, 0, 0, 0, 0, 0, 0, 0, 0 };   // HEAACWAVEINFO after the WAVEFORMATEX: payload 1 (ADTS)
-            hr = t->SetBlob(MF_MT_USER_DATA, ud, sizeof ud);
+            if (SUCCEEDED(hr)) hr = t->SetBlob(MF_MT_USER_DATA, ud, sizeof ud);
         }
-        if (SUCCEEDED(hr)) hr = mft_->SetInputType(0, t, 0);
-        t->Release();
-        if (FAILED(hr)) { err = "The decoder didn't accept this stream"; Log("radio: decoder input type 0x%08lX (%s %d Hz %d ch)", hr, c == CMp3 ? "MP3" : "AAC", f.rate, f.ch); return false; }
-        if (!PickOutput()) { err = "The decoder has no output format we can play"; return false; }
-        mft_->ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
-        mft_->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
+        if (SUCCEEDED(hr)) hr = mft_->SetInputType(0, t.Get(), 0);
+        if (FAILED(hr)) { err = "The decoder didn't accept this stream"; Log("radio: decoder input type 0x%08lX (%s %d Hz %d ch)", hr, c == CMp3 ? "MP3" : "AAC", f.rate, f.ch); Close(); return false; }
+        if (!PickOutput()) { err = "The decoder has no output format we can play"; Close(); return false; }
+        hr = mft_->ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
+        if (SUCCEEDED(hr)) hr = mft_->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
+        if (FAILED(hr)) { err = "The audio decoder couldn't start"; Close(); return false; }
         return true;
     }
     void Close() { if (mft_) { mft_->Release(); mft_ = nullptr; } time_ = 0; }
     bool IsOpen() const { return mft_ != nullptr; }
     // one compressed frame in; any decoded audio appended to out (16-bit interleaved, at rate()/ch())
     bool Feed(const uint8_t* p, size_t n, int frameSamples, int frameRate, std::vector<int16_t>& out) {
-        IMFSample* smp = nullptr; IMFMediaBuffer* buf = nullptr;
-        if (FAILED(MFCreateSample(&smp)) || FAILED(MFCreateMemoryBuffer((DWORD)n, &buf))) { if (smp) smp->Release(); return false; }
-        BYTE* d = nullptr; buf->Lock(&d, nullptr, nullptr); memcpy(d, p, n); buf->Unlock(); buf->SetCurrentLength((DWORD)n);
-        smp->AddBuffer(buf); buf->Release();
-        LONGLONG dur = (LONGLONG)frameSamples * 10000000 / std::max(frameRate, 1);
-        smp->SetSampleTime(time_); smp->SetSampleDuration(dur); time_ += dur;
-        HRESULT hr = mft_->ProcessInput(0, smp, 0);
-        if (hr == MF_E_NOTACCEPTING) { Drain(out); hr = mft_->ProcessInput(0, smp, 0); }
-        smp->Release();
+        if (!p || !n || n > MAXDWORD) return false;
+        MfOwner<IMFSample> smp;
+        MfOwner<IMFMediaBuffer> buf;
+        HRESULT hr = MFCreateSample(smp.Put());
+        if (FAILED(hr) || !smp.Get()) return false;
+        hr = MFCreateMemoryBuffer((DWORD)n, buf.Put());
+        if (FAILED(hr) || !buf.Get()) return false;
+        BYTE* d = nullptr;
+        hr = buf->Lock(&d, nullptr, nullptr);
+        if (FAILED(hr) || !d) return false;
+        memcpy(d, p, n);
+        HRESULT unlockHr = buf->Unlock();
+        if (FAILED(unlockHr)) return false;
+        hr = buf->SetCurrentLength((DWORD)n);
+        if (SUCCEEDED(hr)) hr = smp->AddBuffer(buf.Get());
         if (FAILED(hr)) return false;
+        LONGLONG dur = (LONGLONG)frameSamples * 10000000 / std::max(frameRate, 1);
+        hr = smp->SetSampleTime(time_);
+        if (SUCCEEDED(hr)) hr = smp->SetSampleDuration(dur);
+        if (FAILED(hr)) return false;
+        hr = mft_->ProcessInput(0, smp.Get(), 0);
+        if (hr == MF_E_NOTACCEPTING) {
+            if (!Drain(out)) return false;
+            hr = mft_->ProcessInput(0, smp.Get(), 0);
+        }
+        if (FAILED(hr)) return false;
+        time_ += dur;
         return Drain(out);
     }
     int rate() const { return rate_; }
@@ -405,57 +635,74 @@ private:
     LONGLONG time_ = 0;
 
     bool PickOutput() {
-        IMFMediaType* best = nullptr; int bestScore = -1;
+        MfOwner<IMFMediaType> best; int bestScore = -1;
         for (DWORD i = 0;; i++) {
-            IMFMediaType* t = nullptr;
-            if (FAILED(mft_->GetOutputAvailableType(0, i, &t))) break;
-            GUID sub{}; t->GetGUID(MF_MT_SUBTYPE, &sub);
-            UINT32 bits = 0; t->GetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, &bits);
+            MfOwner<IMFMediaType> t;
+            if (FAILED(mft_->GetOutputAvailableType(0, i, t.Put())) || !t.Get()) break;
+            GUID sub{};
+            if (FAILED(t->GetGUID(MF_MT_SUBTYPE, &sub))) continue;
+            UINT32 bits = 0;
+            if (FAILED(t->GetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, &bits))) continue;
             int score = sub == MFAudioFormat_PCM && bits == 16 ? 2 : sub == MFAudioFormat_Float && bits == 32 ? 1 : -1;
-            if (score > bestScore) { if (best) best->Release(); best = t; bestScore = score; } else t->Release();
+            if (score > bestScore) { best.Attach(t.Detach()); bestScore = score; }
         }
-        if (!best) return false;
-        HRESULT hr = mft_->SetOutputType(0, best, 0);
-        GUID sub{}; best->GetGUID(MF_MT_SUBTYPE, &sub);
+        if (!best.Get()) return false;
+        HRESULT hr = mft_->SetOutputType(0, best.Get(), 0);
+        GUID sub{};
         UINT32 r = 0, c = 0, b = 0;
-        best->GetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, &r); best->GetUINT32(MF_MT_AUDIO_NUM_CHANNELS, &c); best->GetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, &b);
-        best->Release();
-        if (FAILED(hr) || !r || !c) return false;
+        if (FAILED(hr) || FAILED(best->GetGUID(MF_MT_SUBTYPE, &sub)) ||
+            FAILED(best->GetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, &r)) ||
+            FAILED(best->GetUINT32(MF_MT_AUDIO_NUM_CHANNELS, &c)) ||
+            FAILED(best->GetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, &b)) || !r || !c) return false;
         rate_ = (int)r; ch_ = (int)c; bits_ = (int)b; float_ = sub == MFAudioFormat_Float;
         return true;
     }
     bool Drain(std::vector<int16_t>& out) {
         for (int guard = 0; guard < 64; guard++) {
-            MFT_OUTPUT_STREAM_INFO si{}; mft_->GetOutputStreamInfo(0, &si);
-            IMFSample* os = nullptr;
-            bool provides = (si.dwFlags & (MFT_OUTPUT_STREAM_PROVIDES_SAMPLES | MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES)) != 0;
+            MFT_OUTPUT_STREAM_INFO si{};
+            if (FAILED(mft_->GetOutputStreamInfo(0, &si))) return false;
+            MfOwner<IMFSample> provided;
+            bool provides = (si.dwFlags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES) != 0;
             if (!provides) {
-                IMFMediaBuffer* ob = nullptr;
-                MFCreateSample(&os);
-                MFCreateMemoryBuffer(std::max<DWORD>(si.cbSize, 1 << 16), &ob);
-                os->AddBuffer(ob); ob->Release();
+                MfOwner<IMFMediaBuffer> ob;
+                if (FAILED(MFCreateSample(provided.Put())) || !provided.Get() ||
+                    FAILED(MFCreateMemoryBuffer(std::max<DWORD>(si.cbSize, 1 << 16), ob.Put())) || !ob.Get() ||
+                    FAILED(provided->AddBuffer(ob.Get()))) return false;
             }
-            MFT_OUTPUT_DATA_BUFFER db{}; db.pSample = os; DWORD status = 0;
+            MFT_OUTPUT_DATA_BUFFER db{}; db.pSample = provided.Get(); DWORD status = 0;
             HRESULT hr = mft_->ProcessOutput(0, 1, &db, &status);
             if (db.pEvents) db.pEvents->Release();
             IMFSample* got = db.pSample;
-            if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT) { if (os) os->Release(); return true; }
-            if (hr == MF_E_TRANSFORM_STREAM_CHANGE) { if (os) os->Release(); if (!PickOutput()) return false; continue; }
-            if (FAILED(hr)) { if (os) os->Release(); return false; }
-            IMFMediaBuffer* cb = nullptr;
-            if (got && SUCCEEDED(got->ConvertToContiguousBuffer(&cb))) {
-                BYTE* d = nullptr; DWORD len = 0;
-                cb->Lock(&d, nullptr, &len);
+            MfOwner<IMFSample> returned;
+            if (got && got != provided.Get()) returned.Attach(got);
+            if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT) return true;
+            if (hr == MF_E_TRANSFORM_STREAM_CHANGE) { if (!PickOutput()) return false; continue; }
+            if (FAILED(hr)) return false;
+            if (!got) continue;
+            MfOwner<IMFMediaBuffer> cb;
+            if (FAILED(got->ConvertToContiguousBuffer(cb.Put())) || !cb.Get()) return false;
+            BYTE* d = nullptr; DWORD len = 0;
+            hr = cb->Lock(&d, nullptr, &len);
+            if (FAILED(hr) || (!d && len)) return false;
+            if (d) {
                 if (float_) {
                     const float* fl = (const float*)d; size_t k = len / 4;
-                    for (size_t i = 0; i < k; i++) { float v = fl[i] * 32767.0f; out.push_back((int16_t)std::min(32767.0f, std::max(-32768.0f, v))); }
+                    size_t start = out.size();
+                    out.resize(start + k);
+                    for (size_t i = 0; i < k; i++) {
+                        float v = std::isfinite(fl[i]) ? fl[i] * 32767.0f : 0.0f;
+                        out[start + i] = (int16_t)std::min(32767.0f, std::max(-32768.0f, v));
+                    }
                 } else if (bits_ == 16) {
-                    const int16_t* s = (const int16_t*)d; out.insert(out.end(), s, s + len / 2);
+                    const int16_t* s = (const int16_t*)d;
+                    out.insert(out.end(), s, s + len / 2);
                 }
-                cb->Unlock(); cb->Release();
             }
-            if (got && got != os) got->Release();
-            if (os) os->Release();
+            HRESULT unlockHr = cb->Unlock();
+            if (FAILED(unlockHr)) return false;
+            if (got == provided.Get()) {
+                provided.Reset();
+            }
         }
         return true;
     }
@@ -476,27 +723,31 @@ static std::string FromPlaylist(const std::string& body, bool& hls) {
     size_t p = 0;
     while (p < body.size()) {
         size_t e = body.find('\n', p); if (e == std::string::npos) e = body.size();
-        std::string line = Trim(body.substr(p, e - p));
+        std::string line = gitmo_shared::TrimAsciiWhitespace(body.substr(p, e - p));
         p = e + 1;
         std::string l = Lower(line);
         size_t eq = l.find('=');
-        if (l.rfind("file", 0) == 0 && eq != std::string::npos) line = Trim(line.substr(eq + 1)), l = Lower(line);
+        if (l.rfind("file", 0) == 0 && eq != std::string::npos) line = gitmo_shared::TrimAsciiWhitespace(line.substr(eq + 1)), l = Lower(line);
         if (l.rfind("http://", 0) == 0 || l.rfind("https://", 0) == 0) return line;
     }
     return {};
 }
 
-static void ReaderThread(std::shared_ptr<Session> ss) {
-    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-    MFStartup(MF_VERSION, MFSTARTUP_LITE);
+static void ReaderThreadBody(std::shared_ptr<Session> ss) {
+    ReaderDone done{ ss };
+    MfContext mf;
+    std::string initErr;
+    if (!mf.Start(initErr)) { Set(ss, 4, initErr); return; }
     Http http;
+    HttpBinding binding(*ss, http);
     std::string err, url = ss->st.url;
     bool opened = false;
     for (int depth = 0; depth < 3 && !ss->stop; depth++) {
         if (!http.Open(url, true, err)) break;
         std::string ct = Lower(http.Header("content-type"));
         if (IsPlaylistType(ct, url) && ct.find("audio/mpeg") == std::string::npos) {
-            std::string body; http.ReadAll(body, 1 << 18);
+            std::string body;
+            if (!http.ReadAll(body, 1 << 18)) { err = "The playlist was too large or couldn't be read"; break; }
             bool hls = false;
             std::string next = FromPlaylist(body, hls);
             if (hls) { err = "This station uses HLS streaming, which the phone can't play"; break; }
@@ -508,21 +759,21 @@ static void ReaderThread(std::shared_ptr<Session> ss) {
         opened = true;
         break;
     }
-    if (!opened) { if (!ss->stop) Set(ss, 4, err.empty() ? "Couldn't open the station" : err); ss->readerDone = true; MFShutdown(); CoUninitialize(); return; }
+    if (!opened) { if (!ss->stop) Set(ss, 4, err.empty() ? "Couldn't open the station" : err); return; }
 
     std::string ct = Lower(http.Header("content-type"));
-    int metaint = atoi(http.Header("icy-metaint").c_str());
+    int metaint = std::max(0, ParseInt(http.Header("icy-metaint")));
     Codec codec = ct.find("aac") != std::string::npos ? CAac : (ct.find("mpeg") != std::string::npos || ct.find("mp3") != std::string::npos) ? CMp3 : CNone;
     if (ct.find("ogg") != std::string::npos || ct.find("opus") != std::string::npos || ct.find("flac") != std::string::npos || ct.find("mp4") != std::string::npos) {
         Set(ss, 4, "This station's format (" + ct + ") isn't supported; try its MP3 or AAC stream");
-        ss->readerDone = true; MFShutdown(); CoUninitialize(); return;
+        return;
     }
     {
         std::lock_guard<std::mutex> lk(g_mx);
         if (ss->gen == g_gen) {
             g_state.icyName = http.Header("icy-name");
             if (g_state.icyName.empty()) g_state.icyName = http.Header("ice-name");
-            g_state.kbps = atoi(http.Header("icy-br").c_str());
+            g_state.kbps = std::max(0, ParseInt(http.Header("icy-br")));
             g_state.codec = codec == CAac ? "AAC" : codec == CMp3 ? "MP3" : "";
         }
     }
@@ -536,16 +787,16 @@ static void ReaderThread(std::shared_ptr<Session> ss) {
     bool synced = false; FrameInfo cur{};
     std::vector<int16_t> pcm;
     uint8_t buf[16384];
-    ULONGLONG lastData = GetTickCount64();
     size_t bad = 0;
+    unsigned consecutiveDecodeFailures = 0;
+    bool decodeFailureLogged = false;
     while (!ss->stop) {
         {   // don't race ahead of the speakers: keep about 4 s decoded
             std::unique_lock<std::mutex> lk(ss->mx);
-            if (ss->qFrames > (size_t)ss->qRate * 4) { lk.unlock(); Sleep(30); continue; }
+            if (ss->qDuration > 40000000ull) { lk.unlock(); Sleep(30); continue; }
         }
         int k = http.Read(buf, sizeof buf);
         if (k <= 0) { if (!ss->stop) Set(ss, 4, k == 0 ? "The station stopped sending" : "Lost the connection to the station"); break; }
-        lastData = GetTickCount64();
         // take the ICY metadata out
         int i = 0;
         while (i < k) {
@@ -564,11 +815,11 @@ static void ReaderThread(std::shared_ptr<Session> ss) {
                 if (a != std::string::npos) {
                     a += 13;
                     size_t b = meta.find("';", a);
-                    std::string title = FixText(Trim(meta.substr(a, b == std::string::npos ? std::string::npos : b - a)));
+                    std::string title = FixText(gitmo_shared::TrimAsciiWhitespace(meta.substr(a, b == std::string::npos ? std::string::npos : b - a)));
                     size_t t1 = title.find('~');   // some send "Title~Artist~~year~..."
                     if (t1 != std::string::npos && title.find(" - ") == std::string::npos) {
                         size_t t2 = title.find('~', t1 + 1);
-                        std::string song = Trim(title.substr(0, t1)), artist = Trim(title.substr(t1 + 1, t2 == std::string::npos ? std::string::npos : t2 - t1 - 1));
+                        std::string song = gitmo_shared::TrimAsciiWhitespace(title.substr(0, t1)), artist = gitmo_shared::TrimAsciiWhitespace(title.substr(t1 + 1, t2 == std::string::npos ? std::string::npos : t2 - t1 - 1));
                         title = artist.empty() ? song : artist + " - " + song;
                     }
                     std::lock_guard<std::mutex> lk(g_mx);
@@ -605,6 +856,7 @@ static void ReaderThread(std::shared_ptr<Session> ss) {
                 if (p + f.len + 10 > pend.size()) break;   // need the next header to be sure
                 if (!header(q + f.len, g) || g.rate != f.rate) { p++; bad++; continue; }
                 synced = true;
+                bad = 0;
             } else if (!header(q, f)) { synced = false; continue; }
             if (p + f.len > pend.size()) break;
             if (!dec.IsOpen() || f.rate != cur.rate || f.ch != cur.ch) {
@@ -617,13 +869,24 @@ static void ReaderThread(std::shared_ptr<Session> ss) {
                 if (ss->gen == g_gen && !g_state.kbps && f.kbps) g_state.kbps = f.kbps;
             }
             pcm.clear();
-            if (!dec.Feed(q, f.len, f.samples, f.rate, pcm)) { /* a damaged frame: skip it */ }
+            if (!dec.Feed(q, f.len, f.samples, f.rate, pcm)) {
+                if (!decodeFailureLogged) {
+                    Log("radio: skipping audio frames rejected by the decoder");
+                    decodeFailureLogged = true;
+                }
+                if (++consecutiveDecodeFailures >= 64) {
+                    Set(ss, 4, "The audio decoder stopped accepting this station's stream");
+                    ss->stop = true;
+                    break;
+                }
+            } else {
+                consecutiveDecodeFailures = 0;
+            }
             p += f.len;
             if (!pcm.empty()) {
                 std::lock_guard<std::mutex> lk(ss->mx);
                 Session::Chunk c; c.rate = dec.rate(); c.ch = dec.ch(); c.s.swap(pcm);
-                if (ss->q.empty()) ss->qRate = c.rate;
-                ss->qFrames += c.s.size() / c.ch;
+                ss->qDuration += (uint64_t)(c.s.size() / c.ch) * 10000000ull / c.rate;
                 ss->q.push_back(std::move(c));
             }
         }
@@ -632,42 +895,90 @@ static void ReaderThread(std::shared_ptr<Session> ss) {
         if (pend.size() > (1 << 20)) pend.clear();   // garbage with no frames in it
         if (!synced && bad > (1 << 20)) { Set(ss, 4, "Couldn't find any audio in the stream"); break; }
     }
-    (void)lastData;
     dec.Close();
-    ss->readerDone = true;
-    MFShutdown();
-    CoUninitialize();
+}
+
+static void ReaderThread(std::shared_ptr<Session> ss) {
+    try {
+        ReaderThreadBody(ss);
+    } catch (const std::exception& e) {
+        Log("radio: stream worker failed: %s", e.what());
+        Set(ss, 4, "The stream couldn't be processed");
+    }
 }
 
 // ---- the player: PCM -> waveOut ---------------------------------------------------------------
-static void PlayerThread(std::shared_ptr<Session> ss) {
-    bool nullOut = getenv("GITMO_RADIO_NULLOUT") != nullptr;   // tests: decode, don't make a sound
+struct HandleGuard {
+    HANDLE h = nullptr;
+    ~HandleGuard() { if (h) CloseHandle(h); }
+};
+
+struct WaveOutGuard {
+    HWAVEOUT& device;
+    WAVEHDR* headers;
+    int count;
+    bool Close() {
+        if (!device) return true;
+        MMRESULT r = waveOutReset(device);
+        if (r != MMSYSERR_NOERROR) {
+            Log("radio: waveOutReset failed (%u)", r);
+            return false;
+        }
+        for (int i = 0; i < count; i++) {
+            if (headers[i].dwFlags & WHDR_PREPARED) {
+                r = waveOutUnprepareHeader(device, &headers[i], sizeof(WAVEHDR));
+                if (r != MMSYSERR_NOERROR) {
+                    Log("radio: waveOutUnprepareHeader failed (%u)", r);
+                    return false;
+                }
+            }
+        }
+        r = waveOutClose(device);
+        if (r != MMSYSERR_NOERROR) {
+            Log("radio: waveOutClose failed (%u)", r);
+            return false;
+        }
+        device = nullptr;
+        memset(headers, 0, count * sizeof(WAVEHDR));
+        return true;
+    }
+    ~WaveOutGuard() { Close(); }
+};
+
+static void PlayerThreadBody(std::shared_ptr<Session> ss) {
+    bool nullOut = gitmo_shared::IsEnvironmentVariableSet("GITMO_RADIO_NULLOUT");   // tests: decode, don't make a sound
     const int kBufs = 8;
     HWAVEOUT wo = nullptr;
-    HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    HandleGuard event{ nullOut ? nullptr : CreateEventW(nullptr, FALSE, FALSE, nullptr) };
     WAVEHDR hdr[kBufs]{};
     std::vector<int16_t> mem[kBufs];
+    WaveOutGuard output{ wo, hdr, kBufs };
+    if (!nullOut && !event.h) {
+        Set(ss, 4, "Couldn't create the sound notification event");
+        ss->stop = true;
+        ss->CancelNetwork();
+        return;
+    }
     int rate = 0, ch = 0;
     bool started = false;
     size_t played = 0; double peak = 0;
     ULONGLONG lastLog = GetTickCount64(), lastBatt = 0;
-    auto closeOut = [&]() {
-        if (!wo) return;
-        waveOutReset(wo);
-        for (int i = 0; i < kBufs; i++) if (hdr[i].dwFlags & WHDR_PREPARED) waveOutUnprepareHeader(wo, &hdr[i], sizeof(WAVEHDR));
-        waveOutClose(wo); wo = nullptr;
-        memset(hdr, 0, sizeof hdr);
-    };
     while (!ss->stop) {
         if (GetTickCount64() - lastBatt > 1000) {   // a flat phone can't play the radio
             lastBatt = GetTickCount64();
             if (Battery_Minutes() <= 0.0f) { Log("radio: the phone's battery is flat - radio off"); Radio_Stop(); break; }
             // The radio keeps playing in the main menu and through map changes: the phone works there too.
         }
-        WaitForSingleObject(ev, 25);
+        if (nullOut) Sleep(25);
+        else if (WaitForSingleObject(event.h, 25) == WAIT_FAILED) {
+            Set(ss, 4, "Couldn't wait for the sound device");
+            ss->stop = true;
+            ss->CancelNetwork();
+            break;
+        }
         std::unique_lock<std::mutex> lk(ss->mx);
         if (!started) {   // build up 1.5 s first, so short network hiccups aren't heard
-            if (ss->qFrames < (size_t)ss->qRate * 3 / 2) {
+            if (ss->qDuration < 15000000ull) {
                 bool done = ss->readerDone;
                 lk.unlock();
                 if (done) break;
@@ -693,8 +1004,11 @@ static void PlayerThread(std::shared_ptr<Session> ss) {
             size_t want = (size_t)rate / 40 * ch;   // 25 ms
             size_t n = std::min(want, front.s.size() - front.pos);
             for (size_t i = 0; i < n; i++) peak = std::max(peak, (double)std::abs((int)front.s[front.pos + i]));
-            front.pos += n; played += n / ch; ss->qFrames -= std::min(ss->qFrames, n / ch);
-            if (front.pos >= front.s.size()) { ss->q.pop_front(); if (!ss->q.empty()) ss->qRate = ss->q.front().rate; }
+            front.pos += n; played += n / ch;
+            uint64_t consumed = (uint64_t)(n / ch) * 10000000ull / rate;
+            ss->qDuration -= std::min(ss->qDuration, consumed);
+            if (front.pos >= front.s.size()) ss->q.pop_front();
+            if (ss->q.empty()) ss->qDuration = 0;
             lk.unlock();
             if (GetTickCount64() - lastLog > 5000) { lastLog = GetTickCount64(); Log("radio test: %.1f s played (%d Hz %d ch), peak level %.0f", played / (double)rate, rate, ch, peak); peak = 0; }
             continue;
@@ -704,12 +1018,18 @@ static void PlayerThread(std::shared_ptr<Session> ss) {
             for (int i = 0; i < kBufs; i++) if (wo && (hdr[i].dwFlags & WHDR_PREPARED) && !(hdr[i].dwFlags & WHDR_DONE)) busy = true;
             if (busy) continue;   // let the old format finish first
             lk.unlock();
-            closeOut();
+            if (!output.Close()) { Set(ss, 4, "Couldn't close the previous sound format"); ss->stop = true; ss->CancelNetwork(); break; }
             rate = front.rate; ch = front.ch;
             WAVEFORMATEX wf{}; wf.wFormatTag = WAVE_FORMAT_PCM; wf.nChannels = (WORD)ch; wf.nSamplesPerSec = rate; wf.wBitsPerSample = 16;
             wf.nBlockAlign = (WORD)(ch * 2); wf.nAvgBytesPerSec = rate * wf.nBlockAlign;
-            MMRESULT r = waveOutOpen(&wo, WAVE_MAPPER, &wf, (DWORD_PTR)ev, 0, CALLBACK_EVENT);
-            if (r != MMSYSERR_NOERROR) { wo = nullptr; Set(ss, 4, "Couldn't open the sound device (" + std::to_string(r) + ")"); break; }
+            MMRESULT r = waveOutOpen(&wo, WAVE_MAPPER, &wf, (DWORD_PTR)event.h, 0, CALLBACK_EVENT);
+            if (r != MMSYSERR_NOERROR) {
+                wo = nullptr;
+                Set(ss, 4, "Couldn't open the sound device (" + std::to_string(r) + ")");
+                ss->stop = true;
+                ss->CancelNetwork();
+                break;
+            }
             Log("radio: sound out %d Hz, %d channel%s", rate, ch, ch == 1 ? "" : "s");
             continue;
         }
@@ -718,29 +1038,49 @@ static void PlayerThread(std::shared_ptr<Session> ss) {
         size_t per = (size_t)rate / 20 * ch;
         for (int i = 0; i < kBufs && !ss->q.empty(); i++) {
             if ((hdr[i].dwFlags & WHDR_PREPARED) && !(hdr[i].dwFlags & WHDR_DONE)) continue;
-            if (hdr[i].dwFlags & WHDR_PREPARED) waveOutUnprepareHeader(wo, &hdr[i], sizeof(WAVEHDR));
+            if (hdr[i].dwFlags & WHDR_PREPARED) {
+                MMRESULT r = waveOutUnprepareHeader(wo, &hdr[i], sizeof(WAVEHDR));
+                if (r != MMSYSERR_NOERROR) { Set(ss, 4, "Couldn't recycle a sound buffer"); ss->stop = true; ss->CancelNetwork(); break; }
+            }
             mem[i].clear();
+            if (mem[i].capacity() < per) mem[i].reserve(per);
             while (mem[i].size() < per && !ss->q.empty()) {
                 Session::Chunk& c = ss->q.front();
                 if (c.rate != rate || c.ch != ch) break;
                 size_t n = std::min(per - mem[i].size(), c.s.size() - c.pos);
-                for (size_t j = 0; j < n; j++) mem[i].push_back((int16_t)(c.s[c.pos + j] * gain));
+                size_t start = mem[i].size();
+                mem[i].resize(start + n);
+                for (size_t j = 0; j < n; j++) mem[i][start + j] = (int16_t)(c.s[c.pos + j] * gain);
                 c.pos += n;
-                ss->qFrames -= std::min(ss->qFrames, n / ch);
-                if (c.pos >= c.s.size()) { ss->q.pop_front(); if (!ss->q.empty()) ss->qRate = ss->q.front().rate; }
+                uint64_t consumed = (uint64_t)(n / ch) * 10000000ull / rate;
+                ss->qDuration -= std::min(ss->qDuration, consumed);
+                if (c.pos >= c.s.size()) ss->q.pop_front();
+                if (ss->q.empty()) ss->qDuration = 0;
             }
             if (mem[i].empty()) break;
             memset(&hdr[i], 0, sizeof(WAVEHDR));
             hdr[i].lpData = (LPSTR)mem[i].data(); hdr[i].dwBufferLength = (DWORD)(mem[i].size() * 2);
-            waveOutPrepareHeader(wo, &hdr[i], sizeof(WAVEHDR));
-            waveOutWrite(wo, &hdr[i], sizeof(WAVEHDR));
+            MMRESULT r = waveOutPrepareHeader(wo, &hdr[i], sizeof(WAVEHDR));
+            if (r != MMSYSERR_NOERROR) { Set(ss, 4, "Couldn't prepare a sound buffer"); ss->stop = true; ss->CancelNetwork(); break; }
+            r = waveOutWrite(wo, &hdr[i], sizeof(WAVEHDR));
+            if (r != MMSYSERR_NOERROR) { Set(ss, 4, "Couldn't play a sound buffer"); ss->stop = true; ss->CancelNetwork(); break; }
         }
     }
-    closeOut();
-    CloseHandle(ev);
+    output.Close();
     {
         std::lock_guard<std::mutex> lk(g_mx);
         if (ss->gen == g_gen && g_state.state != 4) g_state.state = 0;
+    }
+}
+
+static void PlayerThread(std::shared_ptr<Session> ss) {
+    try {
+        PlayerThreadBody(ss);
+    } catch (const std::exception& e) {
+        Log("radio: player worker failed: %s", e.what());
+        ss->stop = true;
+        ss->CancelNetwork();
+        Set(ss, 4, "The sound couldn't be played");
     }
 }
 
@@ -748,29 +1088,64 @@ static void PlayerThread(std::shared_ptr<Session> ss) {
 void Radio_Start() { LoadStations(); }
 
 void Radio_Play(const RadioStation& st) {
-    auto ss = std::make_shared<Session>();
-    ss->st = st;
+    std::shared_ptr<Session> ss;
+    try {
+        ss = std::make_shared<Session>();
+        ss->st = st;
+    } catch (const std::exception& e) {
+        Log("radio: couldn't prepare playback: %s", e.what());
+        return;
+    }
+    std::shared_ptr<Session> previous;
     {
         std::lock_guard<std::mutex> lk(g_mx);
-        if (g_cur) g_cur->stop = true;
+        previous = g_cur;
+        if (previous) previous->stop = true;
         ss->gen = ++g_gen;
         g_cur = ss;
         g_state = RadioState();
         g_state.state = 1;
         g_state.url = st.url; g_state.name = st.name; g_state.genre = st.genre;
     }
+    if (previous) previous->CancelNetwork();
     Log("radio: play \"%s\" %s", st.name.c_str(), st.url.c_str());
-    std::thread(ReaderThread, ss).detach();
-    std::thread(PlayerThread, ss).detach();
+    std::thread reader;
+    try {
+        reader = std::thread(ReaderThread, ss);
+        reader.detach();
+    } catch (const std::exception& e) {
+        if (reader.joinable()) reader.detach();
+        ss->stop = true;
+        ss->readerDone = true;
+        Log("radio: couldn't start the stream worker: %s", e.what());
+        Set(ss, 4, "Couldn't start the radio stream");
+        return;
+    }
+    std::thread player;
+    try {
+        player = std::thread(PlayerThread, ss);
+        player.detach();
+    } catch (const std::exception& e) {
+        if (player.joinable()) player.detach();
+        ss->stop = true;
+        ss->CancelNetwork();
+        Log("radio: couldn't start the sound worker: %s", e.what());
+        Set(ss, 4, "Couldn't start the sound player");
+    }
 }
 
 void Radio_Stop() {
-    std::lock_guard<std::mutex> lk(g_mx);
-    if (g_cur) { g_cur->stop = true; g_cur.reset(); Log("radio: stop"); }
-    g_gen++;
-    std::string url = g_state.url, name = g_state.name, genre = g_state.genre;
-    g_state = RadioState();
-    g_state.url = url; g_state.name = name; g_state.genre = genre;   // (Now Playing keeps showing what it was)
+    std::shared_ptr<Session> current;
+    {
+        std::lock_guard<std::mutex> lk(g_mx);
+        current = g_cur;
+        if (current) { current->stop = true; g_cur.reset(); }
+        g_gen++;
+        std::string url = g_state.url, name = g_state.name, genre = g_state.genre;
+        g_state = RadioState();
+        g_state.url = url; g_state.name = name; g_state.genre = genre;   // (Now Playing keeps showing what it was)
+    }
+    if (current) { current->CancelNetwork(); Log("radio: stop"); }
 }
 
 // ---- Browse: the radio-browser.info directory ---------------------------------------------------
@@ -780,41 +1155,37 @@ struct J {
     const char* p; const char* e;
     void ws() { while (p < e && (*p == ' ' || *p == '\n' || *p == '\r' || *p == '\t')) p++; }
     bool str(std::string& out) {
-        ws(); if (p >= e || *p != '"') return false; p++;
-        out.clear();
-        while (p < e && *p != '"') {
-            if (*p == '\\' && p + 1 < e) {
-                p++;
-                char c = *p++;
-                if (c == 'u' && p + 4 <= e) {
-                    unsigned cp = strtoul(std::string(p, 4).c_str(), nullptr, 16); p += 4;
-                    if (cp >= 0xD800 && cp < 0xDC00 && p + 6 <= e && p[0] == '\\' && p[1] == 'u') { unsigned lo = strtoul(std::string(p + 2, 4).c_str(), nullptr, 16); p += 6; cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00); }
-                    if (cp < 0x80) out += (char)cp;
-                    else if (cp < 0x800) { out += (char)(0xC0 | (cp >> 6)); out += (char)(0x80 | (cp & 0x3F)); }
-                    else if (cp < 0x10000) { out += (char)(0xE0 | (cp >> 12)); out += (char)(0x80 | ((cp >> 6) & 0x3F)); out += (char)(0x80 | (cp & 0x3F)); }
-                    else { out += (char)(0xF0 | (cp >> 18)); out += (char)(0x80 | ((cp >> 12) & 0x3F)); out += (char)(0x80 | ((cp >> 6) & 0x3F)); out += (char)(0x80 | (cp & 0x3F)); }
-                } else out += c == 'n' ? '\n' : c == 't' ? '\t' : c == 'r' ? '\r' : c == 'b' ? '\b' : c == 'f' ? '\f' : c;
-            } else out += *p++;
-        }
-        if (p < e) p++;
-        return true;
+        ws();
+        return gitmo_shared::ReadJsonString(p, e, out);
     }
     // any value, as text (strings unquoted; objects/arrays skipped and returned empty)
     bool val(std::string& out) {
         ws(); if (p >= e) return false;
         if (*p == '"') return str(out);
         if (*p == '{' || *p == '[') {
-            int depth = 0; bool inStr = false;
-            for (; p < e; p++) {
-                if (inStr) { if (*p == '\\') p++; else if (*p == '"') inStr = false; continue; }
-                if (*p == '"') inStr = true;
-                else if (*p == '{' || *p == '[') depth++;
-                else if (*p == '}' || *p == ']') { if (--depth == 0) { p++; break; } }
+            char closes[64];
+            int depth = 0;
+            closes[depth++] = *p++ == '{' ? '}' : ']';
+            while (p < e && depth > 0) {
+                if (*p == '"') {
+                    std::string ignored;
+                    if (!str(ignored)) return false;
+                } else if (*p == '{' || *p == '[') {
+                    if (depth == (int)sizeof(closes)) return false;
+                    closes[depth++] = *p++ == '{' ? '}' : ']';
+                } else if (*p == '}' || *p == ']') {
+                    if (*p++ != closes[--depth]) return false;
+                } else {
+                    p++;
+                }
             }
+            if (depth) return false;
             out.clear(); return true;
         }
         const char* s = p;
-        while (p < e && *p != ',' && *p != '}' && *p != ']' && *p != ' ' && *p != '\n' && *p != '\r') p++;
+        while (p < e && *p != ',' && *p != '}' && *p != ']' &&
+               *p != ' ' && *p != '\n' && *p != '\r' && *p != '\t') p++;
+        if (p == s) return false;
         out.assign(s, p);
         return true;
     }
@@ -822,44 +1193,70 @@ struct J {
 }
 
 static bool ParseStations(const std::string& body, std::vector<RadioFound>& out) {
+    std::vector<RadioFound> parsed;
     J j{ body.data(), body.data() + body.size() };
     j.ws(); if (j.p >= j.e || *j.p != '[') return false;
     j.p++;
+    j.ws();
+    if (j.p < j.e && *j.p == ']') {
+        j.p++; j.ws();
+        if (j.p != j.e) return false;
+        out.clear();
+        return true;
+    }
+    size_t entries = 0;
     for (;;) {
-        j.ws(); if (j.p >= j.e) return false;
-        if (*j.p == ']') return true;
-        if (*j.p == ',') { j.p++; continue; }
-        if (*j.p != '{') return false;
+        j.ws(); if (j.p >= j.e || *j.p != '{') return false;
         j.p++;
         std::map<std::string, std::string> o;
         for (;;) {
             j.ws(); if (j.p >= j.e) return false;
             if (*j.p == '}') { j.p++; break; }
-            if (*j.p == ',') { j.p++; continue; }
             std::string k, v;
             if (!j.str(k)) return false;
-            j.ws(); if (j.p < j.e && *j.p == ':') j.p++;
+            j.ws(); if (j.p >= j.e || *j.p != ':') return false;
+            j.p++;
             if (!j.val(v)) return false;
             o[k] = v;
+            j.ws();
+            if (j.p >= j.e) return false;
+            if (*j.p == '}') { j.p++; break; }
+            if (*j.p != ',') return false;
+            j.p++;
         }
         RadioFound f;
-        f.name = Trim(o["name"]); f.url = Trim(o["url_resolved"]); if (f.url.empty()) f.url = Trim(o["url"]);
+        f.name = gitmo_shared::TrimAsciiWhitespace(o["name"]);
+        f.url = gitmo_shared::TrimAsciiWhitespace(o["url_resolved"]);
+        if (f.url.empty()) f.url = gitmo_shared::TrimAsciiWhitespace(o["url"]);
         f.uuid = o["stationuuid"]; f.country = o["countrycode"]; f.codec = o["codec"];
-        f.kbps = atoi(o["bitrate"].c_str());
+        int bitrate = ParseInt(o["bitrate"], -1);
+        f.kbps = bitrate >= 0 && bitrate <= 10000 ? bitrate : 0;
         std::string tags = o["tags"];
         size_t c = tags.find(',');
-        f.genre = Trim(tags.substr(0, c));
+        f.genre = gitmo_shared::TrimAsciiWhitespace(tags.substr(0, c));
         if (!f.genre.empty()) f.genre[0] = (char)toupper((unsigned char)f.genre[0]);
         std::string cd = Lower(f.codec);
-        bool playable = (cd.find("mp3") != std::string::npos || cd.find("aac") != std::string::npos) && o["hls"] != "1";
-        if (!f.name.empty() && !f.url.empty() && playable) out.push_back(f);
+        std::string hls = Lower(o["hls"]);
+        bool playable = (cd.find("mp3") != std::string::npos || cd.find("aac") != std::string::npos) && hls != "1" && hls != "true";
+        if (!f.name.empty() && !f.url.empty() && playable) parsed.push_back(std::move(f));
+        if (++entries > 1000) return false;
+        j.ws();
+        if (j.p >= j.e) return false;
+        if (*j.p == ']') { j.p++; break; }
+        if (*j.p != ',') return false;
+        j.p++;
     }
+    j.ws();
+    if (j.p != j.e) return false;
+    out.swap(parsed);
+    return true;
 }
 
 static std::string UrlEncode(const std::string& s) {
     std::string o; char b[4];
     for (unsigned char c : s) {
-        if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') o += (char)c;
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+            c == '-' || c == '_' || c == '.' || c == '~') o += (char)c;
         else { sprintf_s(b, "%%%02X", c); o += b; }
     }
     return o;
@@ -873,7 +1270,11 @@ static bool ApiGet(const std::string& path, std::string& body, std::string& err)
         int sv = (g_server + i) % 3;
         Http h;
         body.clear();
-        if (h.Open(std::string("https://") + kServers[sv] + path, false, err) && h.ReadAll(body, 4 << 20)) { g_server = sv; return true; }
+        err.clear();
+        if (h.Open(std::string("https://") + kServers[sv] + path, false, err)) {
+            if (h.ReadAll(body, 4 << 20)) { g_server = sv; return true; }
+            err = "The station directory response was too large or incomplete";
+        }
         Log("radio: %s didn't answer (%s)", kServers[sv], err.c_str());
     }
     if (err.empty()) err = "The station directory didn't answer";
@@ -883,18 +1284,14 @@ static bool ApiGet(const std::string& path, std::string& body, std::string& err)
 static std::mutex g_srMx;
 static int g_srState = 0;              // 0 nothing yet, 1 searching, 2 done, 3 failed
 static unsigned g_srGen = 0;
+static unsigned g_srVersion = 1;
 static std::string g_srErr, g_srQuery;
 static std::vector<RadioFound> g_srFound;
 
-void Radio_Search(const std::string& query) {
-    unsigned gen;
-    {
-        std::lock_guard<std::mutex> lk(g_srMx);
-        gen = ++g_srGen; g_srState = 1; g_srErr.clear(); g_srQuery = query; g_srFound.clear();
-    }
-    std::thread([gen, query] {
+static void SearchThread(unsigned gen, std::string query) {
+    try {
         std::vector<RadioFound> found; std::string err, body;
-        std::string q = Trim(query);
+        std::string q = gitmo_shared::TrimAsciiWhitespace(query);
         bool ok;
         const std::string tail = "&limit=60&hidebroken=true&order=clickcount&reverse=true";
         if (q.empty()) ok = ApiGet("/json/stations/topclick/80?hidebroken=true", body, err) && ParseStations(body, found);
@@ -902,11 +1299,12 @@ void Radio_Search(const std::string& query) {
             ok = ApiGet("/json/stations/search?name=" + UrlEncode(q) + tail, body, err) && ParseStations(body, found);
             if (ok && found.size() < 15) {   // few by name: add stations with it as a genre tag
                 std::vector<RadioFound> more;
+                std::set<std::string> urls;
+                for (const auto& f : found) urls.insert(f.url);
                 if (ApiGet("/json/stations/search?tag=" + UrlEncode(Lower(q)) + tail, body, err) && ParseStations(body, more))
                     for (auto& m : more) {
-                        bool dup = false;
-                        for (auto& f : found) if (f.url == m.url) dup = true;
-                        if (!dup) found.push_back(m);
+                        if (found.size() >= 60) break;
+                        if (urls.insert(m.url).second) found.push_back(std::move(m));
                     }
             }
         }
@@ -914,17 +1312,65 @@ void Radio_Search(const std::string& query) {
         std::lock_guard<std::mutex> lk(g_srMx);
         if (gen != g_srGen) return;
         g_srState = ok ? 2 : 3; g_srErr = err; g_srFound.swap(found);
+        ++g_srVersion;
         Log("radio: search \"%s\": %s, %zu playable", q.c_str(), ok ? "ok" : err.c_str(), g_srFound.size());
-    }).detach();
+    } catch (const std::exception& e) {
+        Log("radio: station search failed: %s", e.what());
+        std::lock_guard<std::mutex> lk(g_srMx);
+        if (gen == g_srGen) {
+            g_srState = 3;
+            g_srErr = "The station search couldn't be completed";
+            g_srFound.clear();
+            ++g_srVersion;
+        }
+    }
 }
 
-int Radio_SearchResult(std::vector<RadioFound>& out, std::string& err, std::string& query) {
+void Radio_Search(const std::string& query) {
+    unsigned gen;
+    {
+        std::lock_guard<std::mutex> lk(g_srMx);
+        gen = ++g_srGen; g_srState = 1; g_srErr.clear(); g_srQuery = query; g_srFound.clear();
+        ++g_srVersion;
+    }
+    std::thread worker;
+    try {
+        worker = std::thread(SearchThread, gen, query);
+        worker.detach();
+    } catch (const std::exception& e) {
+        if (worker.joinable()) worker.detach();
+        Log("radio: couldn't start station search: %s", e.what());
+        std::lock_guard<std::mutex> lk(g_srMx);
+        if (gen == g_srGen) {
+            g_srState = 3;
+            g_srErr = "Couldn't start the station search";
+            ++g_srVersion;
+        }
+    }
+}
+
+int Radio_SearchResult(unsigned& version, std::vector<RadioFound>& out, std::string& err, std::string& query) {
     std::lock_guard<std::mutex> lk(g_srMx);
-    out = g_srFound; err = g_srErr; query = g_srQuery;
+    if (version != g_srVersion) {
+        out = g_srFound; err = g_srErr; query = g_srQuery;
+        version = g_srVersion;
+    }
     return g_srState;
 }
 
 void Radio_CountClick(const std::string& uuid) {   // radio-browser asks apps to report plays (it ranks stations by them)
     if (uuid.empty()) return;
-    std::thread([uuid] { std::string body, err; ApiGet("/json/url/" + UrlEncode(uuid), body, err); }).detach();
+    try {
+        std::thread worker([uuid] {
+            try {
+                std::string body, err;
+                ApiGet("/json/url/" + UrlEncode(uuid), body, err);
+            } catch (const std::exception& e) {
+                Log("radio: couldn't report station play: %s", e.what());
+            }
+        });
+        worker.detach();
+    } catch (const std::exception& e) {
+        Log("radio: couldn't start station play report: %s", e.what());
+    }
 }

@@ -1,5 +1,6 @@
 // SMS engine test: simulated players over a lossy network.
 #include "chat.h"
+#include "shared.h"
 #include <cstdio>
 #include <memory>
 #include <random>
@@ -106,15 +107,15 @@ int main() {
     // 4. lossy, duplicating network, both directions, many messages
     net.loss = 0.3; net.dup = 0.3; net.maxDelay = 400;
     for (int i = 0; i < 40; i++) {
-        char t[32]; sprintf(t, "a%d", i); A.e->Send(B.sid, t);
-        sprintf(t, "b%d", i); B.e->Send(A.sid, t);
+        char t[32]; sprintf_s(t, sizeof(t), "a%d", i); A.e->Send(B.sid, t);
+        sprintf_s(t, sizeof(t), "b%d", i); B.e->Send(A.sid, t);
         Step(150);
     }
     net.loss = 0; net.dup = 0; net.maxDelay = 50;
     Step(30000);
     auto ab = Texts(B, A, false), ba = Texts(A, B, false);
     std::set<std::string> sab(ab.begin(), ab.end()), sba(ba.begin(), ba.end());
-    int okA = 0, okB = 0; for (int i = 0; i < 40; i++) { okA += sab.count("a" + std::to_string(i)); okB += sba.count("b" + std::to_string(i)); }
+    size_t okA = 0, okB = 0; for (int i = 0; i < 40; i++) { okA += sab.count("a" + std::to_string(i)); okB += sba.count("b" + std::to_string(i)); }
     Check("4a. lossy: every message arrived", okA == 40 && okB == 40);
     Check("4b. lossy: none twice", sab.size() == ab.size() && sba.size() == ba.size());
     bool allDel = true; for (auto& m : C(A, B)->msgs) if (m.mine && m.st == St::Waiting) allDel = false;
@@ -139,7 +140,7 @@ int main() {
     Check("8. unread total", A.e->Unread() == C(A, Cc)->unread + C(A, B)->unread);
 
     // 10. photos
-    auto Blob = [](size_t n, int seed) { std::string s(n, 0); std::mt19937 r(seed); for (auto& ch : s) ch = (char)(r() & 0xFF); return s; };
+    auto Blob = [](size_t n, int seed) { std::string s(n, 0); std::mt19937 r(seed); for (auto& ch : s) ch = (char)(r() & 0xFF); if (n >= 3) { s[0] = (char)0xFF; s[1] = (char)0xD8; s[2] = (char)0xFF; } return s; };
     auto PhotosOf = [](Player& p, Player& o) { std::vector<const Msg*> v; if (auto* c = C(p, o)) for (auto& m : c->msgs) if (m.photo) v.push_back(&m); return v; };
     {
         std::string pic = Blob(150000, 7);   // 4 pieces
@@ -150,7 +151,7 @@ int main() {
         Check("10b. Bob has it once, identical bytes, it rang", bp.size() == 1 && B.photos.count(bp[0]->id) && B.photos[bp[0]->id] == pic && B.rings == ringsBefore + 1);
         auto ap = PhotosOf(A, B);
         Check("10c. Ann sees Delivered", ap.size() == 1 && ap.back()->st == St::Delivered);
-        Check("10d. too big or empty is refused", !A.e->SendPhoto(B.sid, std::string(kMaxPhoto + 1, 'x')) && !A.e->SendPhoto(B.sid, ""));
+        Check("10d. too big, empty or non-JPEG is refused", !A.e->SendPhoto(B.sid, std::string(kMaxPhoto + 1, 'x')) && !A.e->SendPhoto(B.sid, "") && !A.e->SendPhoto(B.sid, "not a JPEG"));
 
         // offline: waits, then goes
         net.offline.insert(B.sid); Presence();
@@ -205,7 +206,7 @@ int main() {
     Check("9b. erase: Cat (offline, previous contact) is gone, unsent message too", C(A, Cc) == nullptr && A.e->Unread() == 0);
     Check("9c. erase: saved to disk", A.disk.find("unsent to cat") == std::string::npos && A.disk.find("hey Bob") == std::string::npos);
     Check("9c2. erase: Ann's photo files are deleted too", A.photos.empty());
-    char rep[64]; sprintf(rep, "C1|MSG|%llx|1700000000000|b39", (unsigned long long)lastBobId);
+    char rep[64]; sprintf_s(rep, sizeof(rep), "C1|MSG|%llx|1700000000000|b39", (unsigned long long)lastBobId);
     A.e->OnMessage(B.sid, rep);
     Check("9d. erase: a late repeat of an erased message doesn't come back", C(A, B)->msgs.empty());
     Check("9e. erase: Bob's copy is untouched", C(B, A)->msgs.size() == bobHad);
@@ -215,6 +216,38 @@ int main() {
     Check("9g. erase: survives a restart", Texts(A, B, false) == std::vector<std::string>{ "after erase" } && C(A, Cc) == nullptr);
     net.offline.erase(Cc.sid); Presence(); Step(6000);
     Check("9h. erase: Cat online again shows as a contact with nothing in it", C(A, Cc) && C(A, Cc)->online && C(A, Cc)->msgs.empty());
+
+    // 11. invalid photos don't create contacts, and their ids are persisted as erased
+    {
+        int acks = 0;
+        IO io;
+        io.send = [&acks](uint64_t, const std::string& packet) { if (packet.find("|ACK|") != std::string::npos) acks++; };
+        Engine receiver(std::move(io));
+        receiver.OnMessage(9001, "C1|PCH|abc|1|0|4|nope");
+        Check("11a. invalid photo is acked without creating a contact", receiver.Contacts().empty() && acks == 1);
+        std::string saved = receiver.Save();
+        Check("11b. rejected photo id is saved", saved.find("E\tabc\n") != std::string::npos);
+        receiver.Load(saved);
+        receiver.OnMessage(9001, "C1|PCH|abc|1|0|4|nope");
+        Check("11c. rejection survives reload and is acked without creating a contact", receiver.Contacts().empty() && acks == 2);
+    }
+
+    // 12. unknown senders and presence updates cannot exceed the contact cap
+    {
+        Engine capped(IO{});
+        for (uint64_t peer = 1; peer <= 501; peer++)
+            capped.OnMessage(peer, "C1|MSG|1|1|hello");
+        Check("12a. incoming messages are capped at 500 contacts", capped.Contacts().size() == 500);
+        capped.SetPresence(502, "Overflow", true, false);
+        Check("12b. presence updates respect the contact cap", capped.Contacts().size() == 500);
+        Check("12c. outgoing messages respect the contact cap", !capped.Send(502, "hello") && capped.Contacts().size() == 500);
+        std::string history;
+        for (uint64_t peer = 1; peer <= 501; peer++)
+            history += "C\t" + std::to_string(peer) + "\t0\t0\t0\tPeer\n";
+        Engine loaded(IO{});
+        loaded.Load(history);
+        Check("12d. loaded history respects the contact cap", loaded.Contacts().size() == 500);
+    }
 
     printf("%s\n", fails ? "SOME TESTS FAILED" : "ALL PASSED");
     return fails;

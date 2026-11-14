@@ -6,6 +6,8 @@
 #include <sstream>
 #include <algorithm>
 #include <cstring>
+#include <cerrno>
+#include <climits>
 
 namespace tx {
 
@@ -29,8 +31,36 @@ static const char* InText(In s) {
 static std::string Clean(const std::string& s) {   // names travel inside '|'-separated messages
     std::string o;
     for (char c : s) if (c != '|' && c != '\n' && c != '\r' && c != '\t') o += c;
-    if (o.size() > 48) o.resize(48);
+    if (o.size() > 48) {
+        size_t end = 48;
+        if (((unsigned char)o[end] & 0xC0) == 0x80) {
+            while (end && ((unsigned char)o[end] & 0xC0) == 0x80) --end;
+        }
+        o.resize(end);
+    }
     return o;
+}
+
+static bool ParseUnsigned(const std::string& s, int base, uint64_t& value) {
+    if (s.empty()) return false;
+    for (unsigned char c : s) {
+        bool digit = c >= '0' && c <= '9';
+        bool hex = (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+        if (!digit && !(base == 16 && hex)) return false;
+    }
+    errno = 0;
+    char* end = nullptr;
+    unsigned long long parsed = strtoull(s.c_str(), &end, base);
+    if (errno == ERANGE || end != s.c_str() + s.size()) return false;
+    value = (uint64_t)parsed;
+    return true;
+}
+
+static bool ParseNonnegative(const std::string& s, long long& value) {
+    uint64_t parsed = 0;
+    if (!ParseUnsigned(s, 10, parsed) || parsed > (uint64_t)LLONG_MAX) return false;
+    value = (long long)parsed;
+    return true;
 }
 
 void Engine::Logf(const char* fmt, ...) const {
@@ -54,7 +84,7 @@ void Engine::SendMsg(uint64_t peer, const std::string& type, uint64_t id, long l
 void Engine::SetOut(Outgoing& o, Out st, const std::string& note) {
     Logf("transfer %llx to %s: %s -> %s%s%s", (unsigned long long)o.id, o.name.c_str(), OutText(o.st), OutText(st),
          note.empty() ? "" : " (", note.empty() ? "" : (note + ")").c_str());
-    o.st = st; o.changed = io_.now(); o.lastSend = 0;
+    o.st = st; o.changed = io_.now(); o.lastSend = 0; o.persistPending = false;
     if (!note.empty()) o.note = note;
     if (st == Out::Expired || st == Out::Canceled || st == Out::Unreachable || st == Out::Failed) o.cancelsLeft = 3;
     // shows in Activity: a transfer that ended without moving any money
@@ -72,7 +102,7 @@ void Engine::SetOut(Outgoing& o, Out st, const std::string& note) {
 
 void Engine::SetIn(Incoming& i, In st, const std::string& why) {
     Logf("transfer %llx from %s: %s -> %s ($%lld)", (unsigned long long)i.id, i.name.c_str(), InText(i.st), InText(st), i.amount);
-    i.st = st; i.changed = io_.now(); i.lastSend = 0;
+    i.st = st; i.changed = io_.now(); i.lastSend = 0; i.persistPending = false;
     if (InFinal(st)) i.wall = io_.wallclock ? io_.wallclock() : 0;
     if (st == In::Declined || st == In::Void) i.why = why;
     if (st == In::Declined || st == In::Void) Note("From " + i.name, i.amount, why.empty() ? (st == In::Declined ? "You declined" : "Called off") : why);
@@ -92,16 +122,15 @@ const Outgoing* Engine::FindOut(uint64_t id) const {
 }
 
 // ---- saved state ----------------------------------------------------------------------
-// Only what must survive a restart: payments the sender made that aren't settled yet
-// (so they get settled or refunded), and transfers the receiver credited (so a repeated
-// payment is never credited twice).
+// Keep unsettled payments, completed refunds, and receiver credits so restarts
+// cannot repeat a money change.
 std::string Engine::Save() const {
     std::string s = "# Gitmo transfers - do not edit while the game is running\n";
     char line[256];
     for (auto& o : outs_) {
-        if (o.st != Out::Paid && o.st != Out::RefundDue) continue;
+        if (o.st != Out::Paid && o.st != Out::RefundDue && o.st != Out::Refunded) continue;
         snprintf(line, sizeof line, "OUT %llu %llx %lld %c %s\n", (unsigned long long)o.peer, (unsigned long long)o.id, o.amount,
-                 o.st == Out::Paid ? 'P' : 'R', Clean(o.name).c_str());
+                 o.st == Out::Paid ? 'P' : o.st == Out::RefundDue ? 'R' : 'F', Clean(o.name).c_str());
         s += line;
     }
     for (auto& i : ins_) {
@@ -113,37 +142,95 @@ std::string Engine::Save() const {
     return s;
 }
 
-void Engine::Persist() { if (io_.persist) io_.persist(Save()); }
+bool Engine::Persist() {
+    if (!io_.persist) {
+        Logf("transfers: can't persist transfer state (storage callback is unavailable)");
+        return false;
+    }
+    if (!io_.persist(Save())) {
+        Logf("transfers: couldn't persist transfer state");
+        return false;
+    }
+    return true;
+}
+
+void Engine::TrimIncomingHistory() {
+    constexpr size_t kMaxUnseenTerminal = 256;
+    auto isUnseenTerminal = [](const Incoming& i) {
+        return i.st != In::Credited && InFinal(i.st) && !i.seen;
+    };
+    size_t count = (size_t)std::count_if(ins_.begin(), ins_.end(), isUnseenTerminal);
+    size_t removed = 0;
+    while (count > kMaxUnseenTerminal) {
+        auto oldest = std::find_if(ins_.begin(), ins_.end(), isUnseenTerminal);
+        if (oldest == ins_.end()) break;
+        ins_.erase(oldest);
+        --count;
+        ++removed;
+    }
+    if (removed) Logf("transfers: discarded %zu oldest unseen request result(s) to cap history", removed);
+}
+
+void Engine::TryRefund(Outgoing& o) {
+    if (!io_.applyMoney(o.amount, "Refund (" + o.name + ")")) {
+        Logf("transfer %llx: refund still cannot be applied", (unsigned long long)o.id);
+        return;
+    }
+    SetOut(o, Out::Refunded);
+    if (Persist()) return;
+
+    if (io_.applyMoney(-o.amount, "Undo unrecorded refund (" + o.name + ")")) {
+        SetOut(o, Out::RefundDue);
+        o.lastSend = io_.now();
+        return;
+    }
+
+    o.persistPending = true;
+    o.lastSend = io_.now();
+    Logf("transfer %llx: refund changed the balance but could not be saved or rolled back; retrying persistence",
+         (unsigned long long)o.id);
+}
 
 void Engine::Load(const std::string& text) {
     std::istringstream in(text);
     std::string line;
     uint64_t now = io_.now();
     long long wall = io_.wallclock ? io_.wallclock() : 0;
-    int nOut = 0, nIn = 0;
+    int nOut = 0, nIn = 0, skipped = 0;
     while (std::getline(in, line)) {
         if (line.empty() || line[0] == '#') continue;
+        if (line.size() > 512) { ++skipped; continue; }
         std::istringstream ls(line);
         std::string kind, p, i, a, f5;
-        if (!(ls >> kind >> p >> i >> a >> f5)) continue;
-        uint64_t peer = strtoull(p.c_str(), nullptr, 10), id = strtoull(i.c_str(), nullptr, 16);
-        long long amount = _atoi64(a.c_str());
-        if (!peer || !id || amount <= 0) continue;
+        if (!(ls >> kind >> p >> i >> a >> f5)) { ++skipped; continue; }
+        uint64_t peer = 0, id = 0;
+        long long amount = 0;
+        if (!ParseUnsigned(p, 10, peer) || !ParseUnsigned(i, 16, id) ||
+            !ParseNonnegative(a, amount) || !peer || !id || amount <= 0 || amount > kMaxAmount) {
+            ++skipped;
+            continue;
+        }
         std::string name; std::getline(ls, name);
         if (!name.empty() && name[0] == ' ') name.erase(0, 1);
-        if (kind == "OUT" && (f5 == "P" || f5 == "R")) {
+        name = Clean(name);
+        if (kind == "OUT" && (f5 == "P" || f5 == "R" || f5 == "F")) {
+            if (FindOutMut(peer, id)) { ++skipped; continue; }
             Outgoing o; o.peer = peer; o.id = id; o.amount = amount; o.name = name;
-            o.st = f5 == "P" ? Out::Paid : Out::RefundDue; o.created = o.changed = now;
+            o.st = f5 == "P" ? Out::Paid : f5 == "R" ? Out::RefundDue : Out::Refunded;
+            o.created = o.changed = now;
             outs_.push_back(o); nOut++;
         } else if (kind == "IN") {
-            long long w = _atoi64(f5.c_str());
+            long long w = 0;
+            if (FindIn(peer, id) || !ParseNonnegative(f5, w)) { ++skipped; continue; }
             if (wall && w && wall - w > kKeepSettledSec) continue;   // old enough to forget
             Incoming x; x.peer = peer; x.id = id; x.amount = amount; x.name = name; x.st = In::Credited;
             x.wall = w; x.seen = true; x.created = x.changed = now;
             ins_.push_back(x); nIn++;
-        }
+        } else ++skipped;
     }
-    Logf("transfers: loaded %d unsettled payment(s), %d received transfer record(s)", nOut, nIn);
+    TrimIncomingHistory();
+    Logf("transfers: loaded %d outgoing and %d received transfer record(s)", nOut, nIn);
+    if (skipped) Logf("transfers: ignored %d malformed or duplicate saved record(s)", skipped);
 }
 
 // ---- the player ---------------------------------------------------------------------------
@@ -153,6 +240,7 @@ SendResult Engine::Send(uint64_t peer, long long amount, uint64_t* idOut) {
     long long bal = io_.balance();
     if (bal < 0) return SendResult::NotInMap;
     if (bal < amount) return SendResult::NotEnough;
+    if (io_.mayPay && !io_.mayPay()) return SendResult::InGarage;
     auto it = peers_.find(peer);
     uint64_t now = io_.now();
     if (it == peers_.end() || !it->second.hasGitmo || now - it->second.lastSeen > kOnline) return SendResult::Offline;
@@ -261,13 +349,31 @@ std::vector<Peer> Engine::OnlinePeersAll() const {
 void Engine::OnMessage(uint64_t from, const std::string& msg) {
     if (!from || from == me_) return;
     // G1|TYPE|id|amount|extra
+    if (msg.size() > 1024) { Logf("transfers: ignored an oversized message"); return; }
     size_t p1 = msg.find('|'), p2 = p1 == std::string::npos ? p1 : msg.find('|', p1 + 1);
     size_t p3 = p2 == std::string::npos ? p2 : msg.find('|', p2 + 1);
     size_t p4 = p3 == std::string::npos ? p3 : msg.find('|', p3 + 1);
-    if (p4 == std::string::npos || msg.compare(0, p1, "G1") != 0) { Logf("transfers: ignored a malformed message"); return; }
+    if (p1 == std::string::npos || p2 == std::string::npos || p3 == std::string::npos ||
+        p4 == std::string::npos || p2 == p1 + 1 || p3 == p2 + 1 || p4 == p3 + 1 ||
+        msg.compare(0, p1, "G1") != 0) {
+        Logf("transfers: ignored a malformed message");
+        return;
+    }
     std::string type = msg.substr(p1 + 1, p2 - p1 - 1);
-    uint64_t id = strtoull(msg.substr(p2 + 1, p3 - p2 - 1).c_str(), nullptr, 16);
-    long long amount = _atoi64(msg.substr(p3 + 1, p4 - p3 - 1).c_str());
+    bool handshake = type == "HELLO" || type == "SESS";
+    bool transaction = type == "OFFER" || type == "CANCEL" || type == "PAY" ||
+                       type == "ACK" || type == "ACCEPT" || type == "DECLINE" ||
+                       type == "RECEIPT" || type == "VOID";
+    uint64_t id = 0;
+    long long amount = 0;
+    if ((!handshake && !transaction) ||
+        !ParseUnsigned(msg.substr(p2 + 1, p3 - p2 - 1), 16, id) ||
+        !ParseNonnegative(msg.substr(p3 + 1, p4 - p3 - 1), amount) ||
+        (handshake && (id != 0 || amount != 0)) ||
+        (transaction && (!id || amount <= 0 || amount > kMaxAmount))) {
+        Logf("transfers: ignored a malformed message");
+        return;
+    }
     std::string extra = Clean(msg.substr(p4 + 1));
     uint64_t now = io_.now();
 
@@ -291,11 +397,10 @@ void Engine::OnMessage(uint64_t from, const std::string& msg) {
         if (InGame(peer) != before) Logf("transfers: %s is %s", NameOf(from).c_str(), before ? "no longer in your game" : "in your game");
         return;
     }
-    if (!id) return;
-
     // ---- we are the receiver ----
     if (type == "OFFER") {
         if (Incoming* i = FindIn(from, id)) {   // a repeat: answer the same again
+            if (i->amount != amount) return;
             if (i->st == In::Prompt) SendMsg(from, "ACK", id, i->amount);
             else if (i->st == In::Accepted) SendMsg(from, "ACCEPT", id, i->amount);
             else if (i->st == In::Declined || i->st == In::Void) SendMsg(from, "DECLINE", id, i->amount, "declined");
@@ -330,20 +435,40 @@ void Engine::OnMessage(uint64_t from, const std::string& msg) {
         return;
     }
     if (type == "CANCEL") {
-        if (Incoming* i = FindIn(from, id)) if (i->st == In::Prompt || i->st == In::Accepted) {
+        if (Incoming* i = FindIn(from, id)) if (i->amount == amount && (i->st == In::Prompt || i->st == In::Accepted)) {
             SetIn(*i, In::Void, i->name + " canceled"); i->seen = false;
             if (io_.ring) io_.ring();   // the receiver hears it, like the request itself
         }
+        TrimIncomingHistory();
         return;
     }
     if (type == "PAY") {
         Incoming* i = FindIn(from, id);
-        if (i && i->st == In::Credited) { SendMsg(from, "RECEIPT", id, i->amount); return; }
+        if (i && i->st == In::Credited && amount == i->amount) {
+            if (i->persistPending) {
+                if (!Persist()) return;
+                i->persistPending = false;
+            }
+            SendMsg(from, "RECEIPT", id, i->amount);
+            return;
+        }
         if (i && i->st == In::Accepted && amount == i->amount) {
             if (io_.applyMoney(amount, "From " + i->name)) {
                 SetIn(*i, In::Credited);
                 i->seen = false;
-                Persist();   // remember it before confirming: a repeated PAY is never credited twice
+                if (!Persist()) {
+                    if (io_.applyMoney(-amount, "Undo unrecorded transfer from " + i->name)) {
+                        SetIn(*i, In::Accepted);
+                        Logf("transfer %llx: couldn't save the credit; rolled it back and will retry",
+                             (unsigned long long)id);
+                    } else {
+                        i->persistPending = true;
+                        i->lastSend = now;
+                        Logf("transfer %llx: credit changed the balance but couldn't be saved or rolled back; withholding receipt",
+                             (unsigned long long)id);
+                    }
+                    return;
+                }
                 SendMsg(from, "RECEIPT", id, amount);
                 return;
             }
@@ -351,6 +476,7 @@ void Engine::OnMessage(uint64_t from, const std::string& msg) {
         }
         // Not accepted, already cancelled, wrong amount or unknown: it will never be credited.
         if (i && !InFinal(i->st)) { SetIn(*i, In::Void, "Didn't arrive"); i->seen = false; }
+        TrimIncomingHistory();
         SendMsg(from, "VOID", id, amount);
         return;
     }
@@ -358,12 +484,19 @@ void Engine::OnMessage(uint64_t from, const std::string& msg) {
     // ---- we are the sender ----
     Outgoing* o = FindOutMut(from, id);
     if (type == "ACK") {
-        if (o && o->st == Out::Offered) SetOut(*o, Out::Asked);
+        if (o && o->amount == amount && o->st == Out::Offered) SetOut(*o, Out::Asked);
         return;
     }
     if (type == "ACCEPT") {
+        if (o && o->amount != amount) return;
         if (!o || (OutFinal(o->st) && o->st != Out::Done)) { SendMsg(from, "CANCEL", id, amount); return; }
-        if (o->st == Out::Paid) { SendMsg(from, "PAY", id, o->amount); o->lastSend = now; return; }
+        if (o->st == Out::Paid) {
+            if (o->persistPending) {
+                if (!Persist()) return;
+                o->persistPending = false;
+            }
+            SendMsg(from, "PAY", id, o->amount); o->lastSend = now; return;
+        }
         if (o->st != Out::Offered && o->st != Out::Asked) return;
         long long bal = io_.balance();
         const char* fail = bal < 0 ? "You're not in a map" : bal < o->amount ? "Not enough money any more" : nullptr;
@@ -378,13 +511,27 @@ void Engine::OnMessage(uint64_t from, const std::string& msg) {
             return;
         }
         SetOut(*o, Out::Paid);
-        Persist();
+        if (!Persist()) {
+            if (io_.applyMoney(o->amount, "Undo unsaved transfer to " + o->name)) {
+                SetOut(*o, Out::Failed, "Couldn't save the transfer");
+                SendMsg(from, "CANCEL", id, o->amount);
+                o->lastSend = now; o->cancelsLeft--;
+                Logf("transfer %llx: couldn't save the payment; rolled it back and canceled",
+                     (unsigned long long)id);
+            } else {
+                o->persistPending = true;
+                o->lastSend = now;
+                Logf("transfer %llx: debit changed the balance but couldn't be saved or rolled back; withholding payment",
+                     (unsigned long long)id);
+            }
+            return;
+        }
         SendMsg(from, "PAY", id, o->amount);
         o->lastSend = now;
         return;
     }
     if (type == "DECLINE") {
-        if (!o || (o->st != Out::Offered && o->st != Out::Asked)) return;
+        if (!o || o->amount != amount || (o->st != Out::Offered && o->st != Out::Asked)) return;
         std::string n = o->name;
         if (extra == "expired") SetOut(*o, Out::Expired, "No answer");
         else if (extra == "notinmap") SetOut(*o, Out::Declined, n + " isn't in a map right now");
@@ -397,16 +544,21 @@ void Engine::OnMessage(uint64_t from, const std::string& msg) {
         return;
     }
     if (type == "RECEIPT") {
-        if (o && o->st == Out::Paid) { SetOut(*o, Out::Done); Persist(); }
+        if (o && o->amount == amount && o->st == Out::Paid) { SetOut(*o, Out::Done); Persist(); }
         return;
     }
     if (type == "VOID") {
-        if (!o) return;
+        if (!o || o->amount != amount) return;
         if (o->st == Out::Paid) {
-            bool ok = io_.applyMoney(o->amount, "Refund (" + o->name + ")");
-            SetOut(*o, ok ? Out::Refunded : Out::RefundDue, "It didn't go through, so the money came back");
-            o->cancelsLeft = 0;
-            Persist();
+            SetOut(*o, Out::RefundDue, "It didn't go through, so the money came back");
+            if (Persist()) {
+                o->cancelsLeft = 0;
+                TryRefund(*o);
+            } else {
+                SetOut(*o, Out::Paid);
+                Logf("transfer %llx: couldn't save refund state; will retry without refunding yet",
+                     (unsigned long long)id);
+            }
         } else if (o->st == Out::Offered || o->st == Out::Asked) {
             SetOut(*o, Out::Expired, "It didn't go through");
             o->cancelsLeft = 0;
@@ -418,7 +570,6 @@ void Engine::OnMessage(uint64_t from, const std::string& msg) {
 // ---- timers ---------------------------------------------------------------------------------
 void Engine::Tick() {
     uint64_t now = io_.now();
-    bool save = false;
     for (auto& o : outs_) {
         auto online = [&]() { auto it = peers_.find(o.peer); return it != peers_.end() && it->second.lastSeen && now - it->second.lastSeen <= kOnline; };
         switch (o.st) {
@@ -430,14 +581,28 @@ void Engine::Tick() {
             if (now - o.created > kOfferTtl) SetOut(o, Out::Expired, "No answer");
             break;
         case Out::Paid: {
+            if (o.persistPending) {
+                if (now - o.lastSend >= kResend) {
+                    o.lastSend = now;
+                    if (Persist()) {
+                        o.persistPending = false;
+                        SendMsg(o.peer, "PAY", o.id, o.amount);
+                        o.lastSend = now;
+                    }
+                }
+                break;
+            }
             uint64_t every = !online() ? 30000 : now - o.changed > 60000 ? kPaidResendMax : kResend;
             if (now - o.lastSend >= every) { SendMsg(o.peer, "PAY", o.id, o.amount); o.lastSend = now; }
             break;
         }
         case Out::RefundDue:
-            if (now - o.lastSend >= kResend) {
+            if (now - o.lastSend >= kResend) { o.lastSend = now; TryRefund(o); }
+            break;
+        case Out::Refunded:
+            if (o.persistPending && now - o.lastSend >= kResend) {
                 o.lastSend = now;
-                if (io_.applyMoney(o.amount, "Refund (" + o.name + ")")) { SetOut(o, Out::Refunded); save = true; }
+                if (Persist()) o.persistPending = false;
             }
             break;
         default:
@@ -457,20 +622,32 @@ void Engine::Tick() {
                 SetIn(i, In::Void, "Didn't arrive"); i.seen = false;
                 SendMsg(i.peer, "VOID", i.id, i.amount);
             } else if (now - i.lastSend >= kResend) { SendMsg(i.peer, "ACCEPT", i.id, i.amount); i.lastSend = now; }
+        } else if (i.st == In::Credited && i.persistPending && now - i.lastSend >= kResend) {
+            i.lastSend = now;
+            if (Persist()) {
+                i.persistPending = false;
+                SendMsg(i.peer, "RECEIPT", i.id, i.amount);
+            }
         }
     }
     // forget finished transfers after a while (credited ones stay on disk, see Save)
+    size_t outsBefore = outs_.size();
     outs_.erase(std::remove_if(outs_.begin(), outs_.end(), [&](const Outgoing& o) {
-        return OutFinal(o.st) && o.cancelsLeft <= 0 && now - o.changed > 10 * 60000; }), outs_.end());
+        return !o.persistPending && OutFinal(o.st) && o.cancelsLeft <= 0 && now - o.changed > 10 * 60000; }), outs_.end());
+    bool save = outs_.size() != outsBefore;
     long long wall = io_.wallclock ? io_.wallclock() : 0;
     size_t before = ins_.size();
     ins_.erase(std::remove_if(ins_.begin(), ins_.end(), [&](const Incoming& i) {
         if (i.st == In::Credited) return wall && i.wall && wall - i.wall > kKeepSettledSec;
         return InFinal(i.st) && i.seen && now - i.changed > 10 * 60000; }), ins_.end());
+    TrimIncomingHistory();
     if (save || ins_.size() != before) Persist();
 }
 
 std::vector<Outgoing> Engine::Outs() const { return outs_; }
 std::vector<Incoming> Engine::Ins() const { return ins_; }
+int Engine::PromptCount() const {
+    return (int)std::count_if(ins_.begin(), ins_.end(), [](const Incoming& i) { return i.st == In::Prompt; });
+}
 
 }   // namespace tx

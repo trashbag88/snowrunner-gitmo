@@ -1,8 +1,8 @@
 // Gitmo - freeze recorder.
 //
 // If the game window stops answering Windows for 6 seconds ("Not responding"),
-// write every thread's call stack to Gitmo.log as module+offset, so a freeze can
-// be traced to the module it is stuck in (the game, a driver, DirectInput, a mod).
+// write captured thread call stacks to Gitmo.log as module+offset, so a freeze
+// can be traced to the module it is stuck in (the game, a driver, a mod).
 //
 // Careful about deadlocks: a thread is only suspended long enough to read its
 // registers (no locks, no allocation while it is stopped); its stack is walked
@@ -18,6 +18,7 @@
 HWND Overlay_Window();
 
 static const int kMaxThreads = 256, kMaxFrames = 28;
+static const ULONGLONG kPollMs = 1000, kHungMs = 6000;
 struct ThreadStack { DWORD tid; int n; uint64_t pc[kMaxFrames]; };
 static ThreadStack g_stacks[kMaxThreads];
 
@@ -83,19 +84,27 @@ static void Where(uint64_t pc, char* out, size_t cap) {
 static void Report(HWND hwnd, int seconds) {
     DWORD uiTid = GetWindowThreadProcessId(hwnd, nullptr);
     int n = CaptureAll();
-    Log("FREEZE: the game window has not responded for %d s - stacks of all %d threads follow (main window thread first)", seconds, n);
+    std::string report;
+    report.reserve(32768);
+    char line[512];
+    sprintf_s(line, "FREEZE: the game window has not responded for %d s - captured %d process threads (watchdog excluded; main window thread first)%s\r\n",
+              seconds, n, n == kMaxThreads ? "; capture limit reached, additional threads may be omitted" : "");
+    report += line;
     for (int pass = 0; pass < 2; pass++) {
         for (int i = 0; i < n; i++) {
             const ThreadStack& s = g_stacks[i];
             if ((pass == 0) != (s.tid == uiTid)) continue;
-            Log(" thread %lu%s:", s.tid, s.tid == uiTid ? " (MAIN window thread)" : "");
+            sprintf_s(line, " thread %lu%s:\r\n", s.tid, s.tid == uiTid ? " (MAIN window thread)" : "");
+            report += line;
             for (int f = 0; f < s.n; f++) {
                 char w[300]; Where(s.pc[f], w, sizeof(w));
-                Log("   %2d %s", f, w);
+                sprintf_s(line, "   %2d %s\r\n", f, w);
+                report += line;
             }
         }
     }
-    Log("FREEZE: end of report");
+    report += "FREEZE: end of report";
+    LogWatchdogReport(report);
 }
 
 static DWORD WINAPI WatchdogThread(LPVOID) {
@@ -103,26 +112,47 @@ static DWORD WINAPI WatchdogThread(LPVOID) {
     while (!(hwnd = Overlay_Window())) Sleep(500);
     int reports = 0;
     bool reportedThisFreeze = false;
-    ULONGLONG hungSince = 0;   // 0 = responding
+    ULONGLONG hungSince = 0;   // start of the first unanswered probe; 0 = responding
     for (;;) {
-        Sleep(1000);
-        if (!IsWindow(hwnd)) { HWND h = Overlay_Window(); if (h) hwnd = h; else continue; }
+        ULONGLONG checkStarted = GetTickCount64();
+        if (!IsWindow(hwnd)) {
+            HWND replacement = Overlay_Window();
+            if (!IsWindow(replacement)) { Sleep(500); continue; }
+            hwnd = replacement;
+        }
         DWORD_PTR r;
         bool alive = SendMessageTimeoutW(hwnd, WM_NULL, 0, 0, SMTO_ABORTIFHUNG | SMTO_BLOCK, 1000, &r) != 0;
         ULONGLONG now = GetTickCount64();
         if (alive) {
-            if (reportedThisFreeze) Log("FREEZE: the game window is responding again after %llu s", (now - hungSince) / 1000);
+            if (reportedThisFreeze) {
+                char message[128];
+                sprintf_s(message, "FREEZE: the game window is responding again after %llu s", (now - hungSince) / 1000);
+                LogWatchdogReport(message);
+            }
             hungSince = 0; reportedThisFreeze = false;
-            continue;
+        } else {
+            if (!hungSince) hungSince = checkStarted;
+            if (now - hungSince >= kHungMs && !reportedThisFreeze && reports < 3) {
+                reportedThisFreeze = true; reports++;
+                Report(hwnd, (int)((now - hungSince) / 1000));
+            }
         }
-        if (!hungSince) hungSince = now - 1000;   // it already failed to answer within the 1 s wait
-        if (now - hungSince >= 6000 && !reportedThisFreeze && reports < 3) {
-            reportedThisFreeze = true; reports++;
-            Report(hwnd, (int)((now - hungSince) / 1000));
-        }
+        ULONGLONG elapsed = GetTickCount64() - checkStarted;
+        if (elapsed < kPollMs) Sleep((DWORD)(kPollMs - elapsed));
     }
 }
 
+static std::atomic<bool> g_watchdogStarted{ false };
+
 void Watchdog_Start() {
-    if (HANDLE t = CreateThread(nullptr, 0, WatchdogThread, nullptr, 0, nullptr)) CloseHandle(t);
+    bool expected = false;
+    if (!g_watchdogStarted.compare_exchange_strong(expected, true)) return;
+    HANDLE t = CreateThread(nullptr, 0, WatchdogThread, nullptr, 0, nullptr);
+    if (!t) {
+        DWORD error = GetLastError();
+        g_watchdogStarted = false;
+        Log("watchdog: couldn't start (error %lu)", error);
+        return;
+    }
+    CloseHandle(t);
 }
