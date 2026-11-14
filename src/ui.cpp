@@ -68,23 +68,7 @@ std::string Steam_PersonaName() {
 }
 
 // ---- helpers ----------------------------------------------------------------------
-static ImDrawList* g_drawListOverride;
-static ImDrawList* DL() { return g_drawListOverride ? g_drawListOverride : ImGui::GetWindowDrawList(); }
-class ScopedDrawListOverride {
-public:
-    ScopedDrawListOverride(ImDrawList* drawList, ImVec2 clipMin, ImVec2 clipMax)
-        : previous_(g_drawListOverride), drawList_(drawList) {
-        drawList_->PushClipRect(clipMin, clipMax, true);
-        g_drawListOverride = drawList_;
-    }
-    ~ScopedDrawListOverride() {
-        drawList_->PopClipRect();
-        g_drawListOverride = previous_;
-    }
-private:
-    ImDrawList* previous_;
-    ImDrawList* drawList_;
-};
+static ImDrawList* DL() { return ImGui::GetWindowDrawList(); }
 
 static ImVec2 Measure(ImFont* f, float size, const char* t) { return f->CalcTextSizeA(size, FLT_MAX, 0, t); }
 static void Text(ImFont* f, float size, ImVec2 p, ImU32 c, const char* t) { DL()->AddText(f, size, p, c, t); }
@@ -834,9 +818,8 @@ static const tx::Incoming* IncomingToShow() {
 }
 
 static void IncomingSheet(const tx::Incoming& in, ImVec2 a, ImVec2 b) {
-    // SMS messages are child-window content, which ImGui renders above its parent window.
-    // Draw the modal in the foreground so inline photos cannot cover the transfer notice.
-    ScopedDrawListOverride drawOnTop(ImGui::GetForegroundDrawList(), a, b);
+    // (Drawn inside its own overlay child window - see BeginOverlay - so the SMS chat, its
+    // photos and the other lists, which are child windows too, stay underneath it.)
     DL()->AddRectFilled(a, b, IM_COL32(0, 0, 0, 120), 34 * s);
     float h = 360 * s;
     ImVec2 p0(a.x, b.y - h), p1 = b;
@@ -913,7 +896,8 @@ static TxView DemoTx(int phase) {
     tx::Incoming i; i.peer = 2; i.id = 0x22; i.amount = 4000; i.name = "Bob"; i.created = now - 9000;
     if (phase == 12) { i.st = tx::In::Prompt; v.ins.push_back(i); }
     if (phase == 14 || phase == 46) { i.st = tx::In::Credited; i.seen = false; v.ins.push_back(i); }
-    if (phase == 44) { i.st = tx::In::Void; i.seen = false; i.why = "Bob canceled"; v.ins.push_back(i); }
+    // 44: canceled over Gitmo's home; 48/49: over the SMS list and Settings (the click test's targets)
+    if (phase == 44 || phase == 48 || phase == 49) { i.st = tx::In::Void; i.seen = false; i.why = "Bob canceled"; v.ins.push_back(i); }
     return v;
 }
 #endif

@@ -1,5 +1,5 @@
 ===============================================================================
-  Gitmo for SnowRunner  v0.9.12 (transfers, text messages, photos and radio)
+  Gitmo for SnowRunner  v0.9.13 (transfers, text messages, photos and radio)
 ===============================================================================
 
 WHAT IT IS
@@ -220,6 +220,11 @@ transfer is still "settling" on the Send screen.)
 
 VERSION HISTORY
 ---------------
+  0.9.13 A big reliability pass by RJArkell: stricter checks on messages and
+         saved files, transfers that can't be saved are rolled back instead
+         of risking a double payment, safer photo/radio/VR handling, and a
+         failed text or photo now stays in the box to try again. Works with
+         players still on 0.9.12.
   0.9.12 Transfer requests and other pop-up cards now always show on top: in
          SMS, Settings and the lists they were drawn behind them, and their
          buttons only worked on a thin strip. The cracked glass covers those

@@ -9,3 +9,6 @@ build/
 __pycache__/
 Gitmo.log
 Gitmo.previous.log
+# release packages are built from dist/ and published as GitHub releases, not committed
+*.zip
+/Gitmo-v*/

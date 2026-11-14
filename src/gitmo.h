@@ -16,7 +16,7 @@
 #include "transfer.h"
 #include "chat.h"
 
-#define GITMO_VERSION "0.9.12"
+#define GITMO_VERSION "0.9.13"
 
 // ---- core (gitmo.cpp) ------------------------------------------------------
 void Log(const char* fmt, ...);

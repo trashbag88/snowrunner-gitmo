@@ -216,11 +216,14 @@ static HRESULT STDMETHODCALLTYPE Hk_GetDeviceData(void* self, DWORD cbObj, DIDEV
     F o = (F)OrigFor(g_data, self);
     if (!o) return E_FAIL;
     bool open = g_menuOpen;
-    DWORD readFlags = open ? flags & ~DIGDD_PEEK : flags;
+    // Only the keyboard and mouse are hidden while the phone is open: their peeks become reads
+    // so nothing typed on the phone is left queued for the game. Other devices (a wheel or
+    // shifter can share this table when no other mod wraps DirectInput) read exactly as asked.
+    int kind = open ? DevKind(self) : 0;
+    DWORD readFlags = kind ? flags & ~DIGDD_PEEK : flags;
     HRESULT hr;
     { DiEnter g(self); if (g.loop) { NoteDiLoop("GetDeviceData"); return DIERR_INPUTLOST; } hr = o(self, cbObj, rgdod, inOut, readFlags); }
     if (open && SUCCEEDED(hr) && inOut) {
-        int kind = DevKind(self);
         if (kind == 2) {
             d_diKbdEvents += (long)*inOut;
             if (rgdod && cbObj >= sizeof(DIDEVICEOBJECTDATA) && !(readFlags & DIGDD_PEEK))
