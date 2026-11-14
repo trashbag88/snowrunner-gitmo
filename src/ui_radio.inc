@@ -2,6 +2,7 @@
 // My stations (saved in Gitmo-radio.ini: add from a link, edit, delete), Browse (the
 // radio-browser.info directory), Now playing (volume, save, share over SMS), and a mini
 // player on the home screen. The sound itself is radio.cpp.
+#include <unordered_map>
 
 enum RadScr { RList, RNow, RForm };
 static RadScr g_radScr = RList;
@@ -14,19 +15,46 @@ static char g_fName[160], g_fUrl[1024], g_fGenre[64];
 static bool g_formDelAsk, g_formFocus, g_formNameAuto, g_formTesting;
 static std::string g_formErr;
 static char g_query[128];
-static bool g_browseLoaded, g_queryFocus;
+static bool g_browseLoaded;
+static unsigned g_radSearchResultVersion;
+static std::vector<RadioFound> g_radSearchFound;
+static std::string g_radSearchErr, g_radSearchQuery;
 static bool g_radShare;                      // the "Share to" sheet
 static std::string g_radToast;
 static ULONGLONG g_radToastUntil;
+static std::unordered_map<std::string, int> g_radUrlIndex;
 
 static bool RadioActive() { return g_rad.state >= 1 && g_rad.state <= 3; }
 static void Toast(const std::string& t) { g_radToast = t; g_radToastUntil = GetTickCount64() + 2500; }
+static bool SaveRadioStations(const std::vector<RadioStation>& list, const char* successToast) {
+    if (!Radio_SetStations(list)) { Toast("Couldn't save stations"); return false; }
+    Toast(successToast);
+    return true;
+}
+static size_t Utf8PrefixLength(const std::string& value, size_t maxBytes) {
+    size_t length = std::min(maxBytes, value.size());
+    if (length < value.size())
+        while (length > 0 && ((unsigned char)value[length] & 0xC0) == 0x80) length--;
+    return length;
+}
+static void CopyUtf8(char* destination, size_t capacity, const std::string& value) {
+    if (!capacity) return;
+    std::string prefix = value.substr(0, Utf8PrefixLength(value, capacity - 1));
+    strcpy_s(destination, capacity, prefix.c_str());
+}
+static void RebuildStationIndex() {
+    g_radUrlIndex.clear();
+    g_radUrlIndex.reserve(g_radList.size());
+    for (size_t i = 0; i < g_radList.size(); i++)
+        g_radUrlIndex.emplace(g_radList[i].url, (int)i);
+}
 
 #ifdef GITMO_TEST
 static void RadioTestState(int phase) {   // made-up stations and playback for the screenshots
     g_radList = { { "Classic Rock 109", "http://test/rock", "Classic rock" }, { "Country Roads FM", "http://test/country", "Country" },
                   { "Lo-fi Trucking", "http://test/lofi", "Chill" }, { "BBC World Service", "http://test/bbc", "News" },
                   { "Dad's Garage Radio", "http://stream.example.net:8000/garage.mp3", "" } };
+    RebuildStationIndex();
     RadioState r; r.state = 3; r.url = "http://test/rock"; r.name = "Classic Rock 109"; r.genre = "Classic rock";
     r.icyName = "CLASSIC ROCK 109"; r.title = "Fleetwood Mac - Dreams"; r.codec = "MP3"; r.kbps = 128; r.volume = Radio_Volume();
     if (phase == 38) { r.url = "http://stream.example.net:8000/garage.mp3"; r.name = ""; r.icyName = "Dad's Garage Radio"; r.title.clear(); }
@@ -36,7 +64,7 @@ static void RadioTestState(int phase) {   // made-up stations and playback for t
 
 static void RadioRefresh() {
     unsigned v = Radio_StationsVersion();
-    if (v != g_radListVer) { g_radList = Radio_Stations(); g_radListVer = v; }
+    if (v != g_radListVer) { g_radList = Radio_Stations(); g_radListVer = v; RebuildStationIndex(); }
     g_rad = Radio_State();
 #ifdef GITMO_TEST
     { extern int g_testFrame; int ph = g_testFrame / 300; if (ph >= 35 && ph <= 41 && ph != 40) RadioTestState(ph); }
@@ -44,8 +72,8 @@ static void RadioRefresh() {
 }
 
 static int SavedIndex(const std::string& url) {
-    for (size_t i = 0; i < g_radList.size(); i++) if (g_radList[i].url == url) return (int)i;
-    return -1;
+    auto it = g_radUrlIndex.find(url);
+    return it == g_radUrlIndex.end() ? -1 : it->second;
 }
 static ImU32 TileColor(const std::string& key) {
     static const unsigned pal[8] = { 0x5E5CE6, 0xFF9F0A, 0x32ADE6, 0xFF453A, 0x30B158, 0xBF5AF2, 0xFF375F, 0x0A84FF };
@@ -62,20 +90,25 @@ static void SplitTitle(const std::string& t, std::string& song, std::string& art
     artist = t.substr(0, d); song = t.substr(d + 3);
 }
 static std::string HostOf(const std::string& url) {
-    size_t a = url.find("://"); a = a == std::string::npos ? 0 : a + 3;
-    size_t b = url.find_first_of(":/?", a);
-    return url.substr(a, b == std::string::npos ? std::string::npos : b - a);
+    size_t start = url.find("://");
+    start = start == std::string::npos ? 0 : start + 3;
+    size_t end = url.find_first_of("/?#", start);
+    std::string authority = url.substr(start, end == std::string::npos ? std::string::npos : end - start);
+    size_t at = authority.rfind('@');
+    if (at != std::string::npos) authority.erase(0, at + 1);
+    if (!authority.empty() && authority[0] == '[') {
+        size_t close = authority.find(']');
+        if (close != std::string::npos) return authority.substr(0, close + 1);
+    }
+    size_t colon = authority.find(':');
+    if (colon != std::string::npos) authority.resize(colon);
+    return authority;
 }
 static bool IsWebLink(const std::string& u) {
     std::string l = u.substr(0, 8);
     for (auto& c : l) c = (char)tolower((unsigned char)c);
     return l.rfind("http://", 0) == 0 || l.rfind("https://", 0) == 0;
 }
-static std::string TrimS(const std::string& s) {
-    size_t a = s.find_first_not_of(" \t\r\n"), b = s.find_last_not_of(" \t\r\n");
-    return a == std::string::npos ? std::string() : s.substr(a, b - a + 1);
-}
-
 // ---- icons ------------------------------------------------------------------------------------
 static void IconStar(ImVec2 c, float r, ImU32 col, bool filled) {
     ImVec2 p[10];
@@ -147,7 +180,9 @@ static bool RadField(const char* id, char* buf, size_t n, ImVec2 a, ImVec2 b, co
     ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(0, 0));
     ImGui::SetNextItemWidth(b.x - a.x - 22 * s);
     if (focus && !g_behindSheet) { ImGui::SetKeyboardFocusHere(); focus = false; }
-    bool enter = !g_behindSheet && ImGui::InputText(id, buf, n, ImGuiInputTextFlags_EnterReturnsTrue);
+    ImGui::BeginDisabled(g_behindSheet);
+    bool enter = ImGui::InputText(id, buf, n, ImGuiInputTextFlags_EnterReturnsTrue);
+    ImGui::EndDisabled();
     bool active = ImGui::IsItemActive();
     ImGui::PopStyleVar();
     ImGui::PopStyleColor(5);
@@ -202,9 +237,9 @@ static void MiniPlayer(ImVec2 a, ImVec2 b, const char* id, bool onWallpaper) {
 static void OpenForm(int idx) {
     g_formIdx = idx; g_formDelAsk = false; g_formErr.clear(); g_formNameAuto = false; g_formTesting = false;
     if (idx >= 0 && idx < (int)g_radList.size()) {
-        strcpy_s(g_fName, g_radList[idx].name.substr(0, sizeof g_fName - 1).c_str());
-        strcpy_s(g_fUrl, g_radList[idx].url.substr(0, sizeof g_fUrl - 1).c_str());
-        strcpy_s(g_fGenre, g_radList[idx].genre.substr(0, sizeof g_fGenre - 1).c_str());
+        CopyUtf8(g_fName, sizeof g_fName, g_radList[idx].name);
+        CopyUtf8(g_fUrl, sizeof g_fUrl, g_radList[idx].url);
+        CopyUtf8(g_fGenre, sizeof g_fGenre, g_radList[idx].genre);
         g_formFocus = false;
     } else {
         g_fName[0] = g_fUrl[0] = g_fGenre[0] = 0;
@@ -286,13 +321,13 @@ static void RadioMine(float x, float y, float w, float bottom) {
 // ---- Browse ---------------------------------------------------------------------------------------------
 static void RadioBrowse(float x, float y, float w, float bottom) {
     float bw = 78 * s;
-    bool go = RadField("##radq", g_query, sizeof g_query, ImVec2(x, y), ImVec2(x + w - bw - 8 * s, y + 38 * s), "Name or genre", g_queryFocus);
+    bool noFocus = false;
+    bool go = RadField("##radq", g_query, sizeof g_query, ImVec2(x, y), ImVec2(x + w - bw - 8 * s, y + 38 * s), "Name or genre", noFocus);
     if (Pill("radsearch", "Search", ImVec2(x + w - bw, y + 1 * s), ImVec2(x + w, y + 37 * s), true)) go = true;
     if (go) { Radio_Search(g_query); g_browseLoaded = true; }
     y += 48 * s;
-    std::vector<RadioFound> found; std::string err, q;
-    int st = Radio_SearchResult(found, err, q);
-    std::string cap = st == 1 ? "SEARCHING..." : q.empty() ? "MOST POPULAR" : "RESULTS FOR \xE2\x80\x9C" + q + "\xE2\x80\x9D";
+    int st = Radio_SearchResult(g_radSearchResultVersion, g_radSearchFound, g_radSearchErr, g_radSearchQuery);
+    std::string cap = st == 1 ? "SEARCHING..." : g_radSearchQuery.empty() ? "MOST POPULAR" : "RESULTS FOR \xE2\x80\x9C" + g_radSearchQuery + "\xE2\x80\x9D";
     for (auto& c : cap) c = (char)toupper((unsigned char)c);
     Text(F_Semi, 12 * s, ImVec2(x + 4 * s, y), T.sub, Fit(F_Semi, 12 * s, cap, w - 40 * s).c_str());
     if (st == 1) Spinner(ImVec2(x + w - 10 * s, y + 8 * s), 7 * s, T.sub);
@@ -304,17 +339,17 @@ static void RadioBrowse(float x, float y, float w, float bottom) {
     if (st == 3) {
         DL()->AddRectFilled(p, ImVec2(p.x + w, p.y + 78 * s), T.card, 16 * s);
         TextCenter(F_Semi, 14 * s, ImVec2(p.x + w * 0.5f, p.y + 16 * s), T.text, "Couldn't reach the station directory");
-        TextCenter(F_Reg, 12.5f * s, ImVec2(p.x + w * 0.5f, p.y + 40 * s), T.sub, Fit(F_Reg, 12.5f * s, err, w - 24 * s).c_str());
+        TextCenter(F_Reg, 12.5f * s, ImVec2(p.x + w * 0.5f, p.y + 40 * s), T.sub, Fit(F_Reg, 12.5f * s, g_radSearchErr, w - 24 * s).c_str());
         p.y += 90 * s;
-    } else if (st == 2 && found.empty()) {
+    } else if (st == 2 && g_radSearchFound.empty()) {
         DL()->AddRectFilled(p, ImVec2(p.x + w, p.y + 78 * s), T.card, 16 * s);
         TextCenter(F_Semi, 14 * s, ImVec2(p.x + w * 0.5f, p.y + 16 * s), T.text, "No stations found");
         TextCenter(F_Reg, 12.5f * s, ImVec2(p.x + w * 0.5f, p.y + 40 * s), T.sub, "Try a shorter name, or a genre like jazz");
         p.y += 90 * s;
-    } else if (!found.empty()) {
-        DL()->AddRectFilled(p, ImVec2(p.x + w, p.y + found.size() * rh), T.card, 16 * s);
-        for (size_t i = 0; i < found.size(); i++) {
-            const RadioFound& f = found[i];
+    } else if (!g_radSearchFound.empty()) {
+        DL()->AddRectFilled(p, ImVec2(p.x + w, p.y + g_radSearchFound.size() * rh), T.card, 16 * s);
+        for (size_t i = 0; i < g_radSearchFound.size(); i++) {
+            const RadioFound& f = g_radSearchFound[i];
             std::string sub = f.codec;
             if (f.kbps) sub += " \xC2\xB7 " + std::to_string(f.kbps) + "k";
             if (!f.country.empty()) sub += " \xC2\xB7 " + f.country;
@@ -323,18 +358,19 @@ static void RadioBrowse(float x, float y, float w, float bottom) {
             int saved = SavedIndex(f.url);
             char id[24]; sprintf_s(id, "radf%zu", i);
             bool click, star;
-            StationRow(id, ImVec2(p.x, p.y + i * rh), w, rh, f.name, cur ? std::string(RadioStateText()) : sub, cur ? kGreen : T.sub, cur, saved >= 0 ? 2 : 0, i + 1 < found.size(), click, &star);
+            StationRow(id, ImVec2(p.x, p.y + i * rh), w, rh, f.name, cur ? std::string(RadioStateText()) : sub, cur ? kGreen : T.sub, cur, saved >= 0 ? 2 : 0, i + 1 < g_radSearchFound.size(), click, &star);
             if (star) {
                 std::vector<RadioStation> list = g_radList;
-                if (saved >= 0) { list.erase(list.begin() + saved); Toast("Removed from My stations"); }
-                else { list.push_back({ f.name, f.url, f.genre }); Toast("Added to My stations"); }
-                Radio_SetStations(list);
+                const char* toast = saved >= 0 ? "Removed from My stations" : "Added to My stations";
+                if (saved >= 0) list.erase(list.begin() + saved);
+                else list.push_back({ f.name, f.url, f.genre });
+                SaveRadioStations(list, toast);
             } else if (click) {
                 if (cur) g_radScr = RNow;
                 else { Radio_Play({ f.name, f.url, f.genre }); Radio_CountClick(f.uuid); }
             }
         }
-        p.y += found.size() * rh + 10 * s;
+        p.y += g_radSearchFound.size() * rh + 10 * s;
         TextCenter(F_Reg, 11.5f * s, ImVec2(p.x + w * 0.5f, p.y), T.sub, "Stations from radio-browser.info");
         p.y += 26 * s;
     }
@@ -441,9 +477,10 @@ static void RadioNow(ImVec2 a, ImVec2 b) {
     ImVec2 sc(cx - 96 * s, pc.y);
     if (Hit("radstar", ImVec2(sc.x - 24 * s, sc.y - 24 * s), ImVec2(sc.x + 24 * s, sc.y + 24 * s))) {
         std::vector<RadioStation> list = g_radList;
-        if (saved >= 0) { list.erase(list.begin() + saved); Toast("Removed from My stations"); }
-        else { list.push_back({ station, g_rad.url, g_rad.genre }); Toast("Added to My stations"); }
-        Radio_SetStations(list);
+        const char* toast = saved >= 0 ? "Removed from My stations" : "Added to My stations";
+        if (saved >= 0) list.erase(list.begin() + saved);
+        else list.push_back({ station, g_rad.url, g_rad.genre });
+        SaveRadioStations(list, toast);
     }
     IconStar(sc, 13 * s, saved >= 0 ? Hex(0xFFCC00) : T.sub, saved >= 0);
     ImVec2 shc(cx + 96 * s, pc.y);
@@ -462,7 +499,7 @@ static void RadioNow(ImVec2 a, ImVec2 b) {
 static void RadioForm(ImVec2 a, ImVec2 b) {
     float x = a.x + 20 * s, w = b.x - a.x - 40 * s, y = a.y + 6 * s, cx = (a.x + b.x) * 0.5f;
     bool editing = g_formIdx >= 0 && g_formIdx < (int)g_radList.size();
-    std::string url = TrimS(g_fUrl);
+    std::string url = gitmo_shared::TrimAsciiWhitespace(g_fUrl);
     bool testingThis = !url.empty() && g_rad.url == url;
     // header: Cancel   Add station   Save
     bool cancel = Hit("radfcancel", ImVec2(x - 6 * s, y), ImVec2(x + 70 * s, y + 32 * s));
@@ -491,7 +528,7 @@ static void RadioForm(ImVec2 a, ImVec2 b) {
     y += 34 * s;
     // the name fills in from the stream once a test finds it
     if (g_formNameAuto && testingThis && !g_rad.icyName.empty()) {
-        if (!g_fName[0]) strcpy_s(g_fName, g_rad.icyName.substr(0, sizeof g_fName - 1).c_str());
+        if (!g_fName[0]) CopyUtf8(g_fName, sizeof g_fName, g_rad.icyName);
         g_formNameAuto = false;
     }
     bool noFocus = false;
@@ -508,7 +545,7 @@ static void RadioForm(ImVec2 a, ImVec2 b) {
     if (Pill("radftest", playingThis ? "Stop" : "Test play", ImVec2(x, y), ImVec2(x + w, y + 40 * s), false)) {
         if (playingThis) Radio_Stop();
         else if (!IsWebLink(url)) g_formErr = "Enter a stream link starting with http:// or https://";
-        else { g_formErr.clear(); g_formTesting = true; g_formNameAuto = !g_fName[0]; Radio_Play({ TrimS(g_fName), url, TrimS(g_fGenre) }); }
+        else { g_formErr.clear(); g_formTesting = true; g_formNameAuto = !g_fName[0]; Radio_Play({ gitmo_shared::TrimAsciiWhitespace(g_fName), url, gitmo_shared::TrimAsciiWhitespace(g_fGenre) }); }
     }
     y += 52 * s;
     if (!g_formErr.empty()) { DL()->AddText(F_Reg, 12.5f * s, ImVec2(x + 4 * s, y), kRedText(), g_formErr.c_str(), nullptr, w - 8 * s); y += 36 * s; }
@@ -526,8 +563,7 @@ static void RadioForm(ImVec2 a, ImVec2 b) {
             if (DangerPill("radfdelyes", "Delete", ImVec2(x + 24 * s + bw2, by), ImVec2(x + 24 * s + 2 * bw2, by + 36 * s), true)) {
                 std::vector<RadioStation> list = g_radList;
                 list.erase(list.begin() + g_formIdx);
-                Radio_SetStations(list);
-                Toast("Station deleted");
+                if (!SaveRadioStations(list, "Station deleted")) return;
                 g_formDelAsk = false; g_radScr = RList;
                 if (list.empty()) g_radEdit = false;
                 return;
@@ -536,13 +572,12 @@ static void RadioForm(ImVec2 a, ImVec2 b) {
     }
     if (save) {
         if (!IsWebLink(url)) { g_formErr = "Enter a stream link starting with http:// or https://"; return; }
-        std::string name = TrimS(g_fName);
+        std::string name = gitmo_shared::TrimAsciiWhitespace(g_fName);
         if (name.empty()) name = testingThis && !g_rad.icyName.empty() ? g_rad.icyName : HostOf(url);
         std::vector<RadioStation> list = g_radList;
-        RadioStation st{ name, url, TrimS(g_fGenre) };
+        RadioStation st{ name, url, gitmo_shared::TrimAsciiWhitespace(g_fGenre) };
         if (editing) list[g_formIdx] = st; else list.push_back(st);
-        Radio_SetStations(list);
-        Toast(editing ? "Station saved" : "Station added");
+        if (!SaveRadioStations(list, editing ? "Station saved" : "Station added")) return;
         g_radScr = RList; g_radTab = 0;
         return;
     }
@@ -594,16 +629,21 @@ static void RadioShareSheet(ImVec2 a, ImVec2 b) {
         Text(F_Semi, 15 * s, ImVec2(r0.x + 54 * s, r0.y + 9 * s), T.text, Fit(F_Semi, 15 * s, name, w - 70 * s).c_str());
         Text(F_Reg, 12 * s, ImVec2(r0.x + 54 * s, r0.y + 29 * s), c.online ? kGreen : T.sub, c.online ? "Online" : "Sends when they're online");
         if (click) {
-            // SMS keeps 300 bytes: shorten the song/station text so the link always arrives whole
-            const size_t kRoom = 300;
-            size_t fixed = (sizeof("\xF0\x9F\x93\xBB Listening to ") - 1) + 1 + g_rad.url.size();
-            if (fixed + what.size() > kRoom && kRoom > fixed + 13) {
-                size_t cut = kRoom - fixed - 3;
-                while (cut > 0 && ((unsigned char)what[cut] & 0xC0) == 0x80) cut--;   // not inside a character
-                what = what.substr(0, cut) + "\xE2\x80\xA6";
+            const std::string prefix = "\xF0\x9F\x93\xBB Listening to ";
+            size_t fixed = prefix.size() + 1 + g_rad.url.size();
+            if (fixed > sms::kMaxText) {
+                Toast("Link is too long to share");
+            } else {
+                size_t titleRoom = sms::kMaxText - fixed;
+                if (what.size() > titleRoom) {
+                    const std::string ellipsis = "\xE2\x80\xA6";
+                    what = titleRoom >= ellipsis.size()
+                        ? what.substr(0, Utf8PrefixLength(what, titleRoom - ellipsis.size())) + ellipsis
+                        : std::string();
+                }
+                std::string msg = prefix + what + "\n" + g_rad.url;
+                if (Sms_Send(c.id, msg)) Toast("Sent to " + name); else Toast("Couldn't send");
             }
-            std::string msg = "\xF0\x9F\x93\xBB Listening to " + what + "\n" + g_rad.url;
-            if (Sms_Send(c.id, msg)) Toast("Sent to " + name); else Toast("Couldn't send");
             g_radShare = false;
         }
     }

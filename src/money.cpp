@@ -14,6 +14,7 @@
 // developer test buttons in the phone's Settings are pressed.
 
 #include "gitmo.h"
+#include "shared.h"
 #include <tlhelp32.h>
 #include <cstdio>
 #include <cstdarg>
@@ -26,14 +27,11 @@
 
 static std::mutex g_mx;
 static MoneyState g_st;                 // guarded by g_mx
+static std::atomic<uint64_t> g_stVersion{1};
 static std::atomic<bool> g_rescan{false};
 
 // ---- guarded memory access ------------------------------------------------------
-static bool SafeCopy(void* dst, const void* src, size_t n) {
-    __try { memcpy(dst, src, n); return true; }
-    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
-}
-static bool SafeRead32(uintptr_t a, int32_t& v) { return SafeCopy(&v, (const void*)a, 4); }
+static bool SafeRead32(uintptr_t a, int32_t& v) { return gitmo_shared::SafeCopyMemory(&v, (const void*)a, 4); }
 static bool SafeWrite32(uintptr_t a, int32_t v) {
     __try { *(volatile int32_t*)a = v; return true; }
     __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
@@ -164,7 +162,7 @@ static void CollectStacks() {
         if (q(t, 0, &tbi, sizeof(tbi), nullptr) == 0 && tbi.Teb) {
             NT_TIB tib;
             MEMORY_BASIC_INFORMATION mbi;
-            if (SafeCopy(&tib, tbi.Teb, sizeof(tib)) && VirtualQuery((uint8_t*)tib.StackBase - 1, &mbi, sizeof(mbi)))
+            if (gitmo_shared::SafeCopyMemory(&tib, tbi.Teb, sizeof(tib)) && VirtualQuery((uint8_t*)tib.StackBase - 1, &mbi, sizeof(mbi)))
                 g_stackAllocs.push_back((uintptr_t)mbi.AllocationBase);
         }
         CloseHandle(t);
@@ -231,7 +229,7 @@ static bool LooksLikeProfile(const uint8_t* p, int32_t xp, int32_t money, int32_
 
 static bool StillProfile(uintptr_t a, int32_t minXp, int32_t& money) {
     uint8_t b[0x20];
-    if (!SafeCopy(b, (void*)a, sizeof(b))) return false;
+    if (!gitmo_shared::SafeCopyMemory(b, (void*)a, sizeof(b))) return false;
     const int32_t* d = (const int32_t*)b;
     if ((uint32_t)d[1] != kIntTag || (uint32_t)d[3] != kIntTag || (uint32_t)d[7] != kIntTag) return false;
     if ((*(const uint64_t*)(b + 0x10) >> 48) != 0x20 || d[0] < kMinMoney || d[2] < minXp) return false;
@@ -252,7 +250,7 @@ static std::vector<Candidate> ScanForMoney(const std::vector<SlotSave>& slots, s
     ForEachRegion([&](uintptr_t base, size_t size) {
         for (size_t off = 0; off < size; off += kChunk) {
             size_t n = std::min(size - off, kChunk + 0x20);   // small overlap so a record on a chunk edge is seen
-            if (!SafeCopy(buf.data(), (void*)(base + off), n)) continue;
+            if (!gitmo_shared::SafeCopyMemory(buf.data(), (void*)(base + off), n)) continue;
             bytes += std::min(kChunk, size - off);
             size_t stop = std::min(n, kChunk);
             for (size_t i = 0; i + 0x20 <= n && i < stop; i += 8) {
@@ -280,7 +278,7 @@ struct ProbeHit { uintptr_t addr, allocBase; size_t regionSize; };
 
 static std::string HexAround(uintptr_t a, size_t before, size_t after) {
     std::vector<uint8_t> b(before + after);
-    if (!SafeCopy(b.data(), (void*)(a - before), b.size())) return "(unreadable)";
+    if (!gitmo_shared::SafeCopyMemory(b.data(), (void*)(a - before), b.size())) return "(unreadable)";
     std::string s;
     char h[4];
     for (size_t i = 0; i < b.size(); i++) {
@@ -316,7 +314,7 @@ static void ProbeOnce(int round) {
         std::lock_guard<std::mutex> scanLock(g_scanMx);
         CollectStacks();
         const size_t kChunk = 1 << 20;
-        std::vector<uint8_t> buf(kChunk + 256);
+        std::vector<uint8_t> buf(kChunk + maxLen);
         SYSTEM_INFO si; GetSystemInfo(&si);
         uintptr_t a = (uintptr_t)si.lpMinimumApplicationAddress, end = (uintptr_t)si.lpMaximumApplicationAddress;
         MEMORY_BASIC_INFORMATION mbi;
@@ -326,7 +324,7 @@ static void ProbeOnce(int round) {
             if (!Scannable(mbi)) continue;
             for (size_t off = 0; off < size; off += kChunk) {
                 size_t n = std::min(size - off, kChunk + maxLen);
-                if (!SafeCopy(buf.data(), (void*)(base + off), n)) continue;
+                if (!gitmo_shared::SafeCopyMemory(buf.data(), (void*)(base + off), n)) continue;
                 size_t stop = std::min(n, kChunk);
                 bytes += stop;
                 const uint8_t* p = buf.data();
@@ -397,7 +395,7 @@ static std::string Where(uintptr_t a) {
 
 static void HexDump(uintptr_t a, size_t n) {
     std::vector<uint8_t> b(n);
-    if (!SafeCopy(b.data(), (void*)a, n)) { Log("  (unreadable)"); return; }
+    if (!gitmo_shared::SafeCopyMemory(b.data(), (void*)a, n)) { Log("  (unreadable)"); return; }
     for (size_t i = 0; i < n; i += 16) {
         char line[128]; int p = sprintf_s(line, "  %+05X:", (int)i - (int)(n / 2));
         for (size_t j = 0; j < 16; j += 4) p += sprintf_s(line + p, sizeof(line) - p, " %08X", *(uint32_t*)&b[i + j]);
@@ -411,6 +409,8 @@ static void HexDump(uintptr_t a, size_t n) {
 
 // Who points at the money's object? Level 1 anywhere, level 2 from the exe's globals.
 static void PointerSearch(uintptr_t money) {
+    std::lock_guard<std::mutex> scanLock(g_scanMx);
+    CollectStacks();
     const uintptr_t lo1 = money - 0x2000, hi1 = money;
     struct P { uintptr_t at, to; };
     std::vector<P> lvl1;
@@ -420,7 +420,7 @@ static void PointerSearch(uintptr_t money) {
             if (exeOnly && !(base >= g_exeBase && base < g_exeEnd)) return;
             for (size_t off = 0; off < size && out.size() < cap; off += buf.size()) {
                 size_t n = std::min(buf.size(), size - off);
-                if (!SafeCopy(buf.data(), (void*)(base + off), n)) continue;
+                if (!gitmo_shared::SafeCopyMemory(buf.data(), (void*)(base + off), n)) continue;
                 for (size_t i = 0; i + 8 <= n; i += 8) {
                     uint64_t v = *(uint64_t*)&buf[i];
                     if (v >= lo && v <= hi) { out.push_back({base + off + i, (uintptr_t)v}); if (out.size() >= cap) break; }
@@ -458,7 +458,7 @@ static void DumpImage() {
     std::vector<uint8_t> page(0x1000);
     size_t ok = 0;
     for (uintptr_t a = g_exeBase; a < g_exeEnd; a += 0x1000) {
-        if (!SafeCopy(page.data(), (void*)a, 0x1000)) std::fill(page.begin(), page.end(), 0); else ok++;
+        if (!gitmo_shared::SafeCopyMemory(page.data(), (void*)a, 0x1000)) std::fill(page.begin(), page.end(), 0); else ok++;
         DWORD w; WriteFile(h, page.data(), 0x1000, &w, nullptr);
     }
     CloseHandle(h);
@@ -466,15 +466,72 @@ static void DumpImage() {
 }
 
 // Hardware breakpoint: which game instructions touch the money (logging only).
-static uintptr_t g_bpAddr;
-static int g_bpSlot = -1;
+static std::atomic<uintptr_t> g_bpAddr{0};
+static std::atomic<int> g_bpSlot{-1};
 struct Hit { std::atomic<uint64_t> rip{0}; std::atomic<uint32_t> count{0}; };
 static Hit g_hits[64];
 static PVOID g_veh;
 
+static uintptr_t DrAddress(const CONTEXT& c, int slot) {
+    switch (slot) {
+    case 0: return (uintptr_t)c.Dr0;
+    case 1: return (uintptr_t)c.Dr1;
+    case 2: return (uintptr_t)c.Dr2;
+    default: return (uintptr_t)c.Dr3;
+    }
+}
+
+static void SetDrAddress(CONTEXT& c, int slot, uintptr_t address) {
+    switch (slot) {
+    case 0: c.Dr0 = address; break;
+    case 1: c.Dr1 = address; break;
+    case 2: c.Dr2 = address; break;
+    default: c.Dr3 = address; break;
+    }
+}
+
+static DWORD64 DrSlotMask(int slot) { return (3ull << (slot * 2)) | (0xFull << (16 + slot * 4)); }
+static DWORD64 DrEnableMask(int slot) { return 3ull << (slot * 2); }
+
+struct BpLease {
+    DWORD threadId;
+    int slot;
+    uintptr_t address;
+    DWORD64 oldAddress;
+    DWORD64 oldControl;
+    DWORD64 installedControl;
+};
+static std::mutex g_bpMx;
+static std::vector<BpLease> g_bpLeases;
+
+static int FindFreeBreakpointSlot() {
+    bool busy[4] = {};
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snap == INVALID_HANDLE_VALUE) return -1;
+    THREADENTRY32 te{ sizeof(te) };
+    DWORD pid = GetCurrentProcessId(), me = GetCurrentThreadId();
+    for (BOOL ok = Thread32First(snap, &te); ok; ok = Thread32Next(snap, &te)) {
+        if (te.th32OwnerProcessID != pid || te.th32ThreadID == me) continue;
+        HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_SUSPEND_RESUME, FALSE, te.th32ThreadID);
+        if (!t) continue;
+        if (SuspendThread(t) != (DWORD)-1) {
+            CONTEXT c{}; c.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+            if (GetThreadContext(t, &c))
+                for (int s = 0; s < 4; ++s) if (c.Dr7 & DrEnableMask(s)) busy[s] = true;
+            ResumeThread(t);
+        }
+        CloseHandle(t);
+    }
+    CloseHandle(snap);
+    for (int s = 0; s < 4; ++s) if (!busy[s]) return s;
+    return -1;
+}
+
 static LONG CALLBACK BpHandler(EXCEPTION_POINTERS* e) {
-    if (e->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP || g_bpSlot < 0) return EXCEPTION_CONTINUE_SEARCH;
-    if (!(e->ContextRecord->Dr6 & (1ull << g_bpSlot))) return EXCEPTION_CONTINUE_SEARCH;
+    int slot = g_bpSlot.load(std::memory_order_acquire);
+    if (e->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP || slot < 0) return EXCEPTION_CONTINUE_SEARCH;
+    if (!(e->ContextRecord->Dr6 & (1ull << slot)) || DrAddress(*e->ContextRecord, slot) != g_bpAddr.load(std::memory_order_acquire))
+        return EXCEPTION_CONTINUE_SEARCH;
     uint64_t rip = e->ContextRecord->Rip;
     for (auto& h : g_hits) {
         uint64_t cur = h.rip.load();
@@ -488,9 +545,44 @@ static LONG CALLBACK BpHandler(EXCEPTION_POINTERS* e) {
     return EXCEPTION_CONTINUE_EXECUTION;
 }
 
-static bool g_bpWriteOnly = false;
+static std::atomic<bool> g_bpWriteOnly{false};
 static int SetBreakpointAllThreads(bool on) {
     int done = 0;
+    std::lock_guard<std::mutex> leaseLock(g_bpMx);
+    if (!on) {
+        for (auto it = g_bpLeases.begin(); it != g_bpLeases.end();) {
+            HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME, FALSE, it->threadId);
+            if (!t) { it = g_bpLeases.erase(it); continue; }
+            if (SuspendThread(t) == (DWORD)-1) { CloseHandle(t); ++it; continue; }
+            CONTEXT c{}; c.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+            bool keep = false;
+            if (GetThreadContext(t, &c)) {
+                DWORD64 mask = DrSlotMask(it->slot);
+                bool ours = DrAddress(c, it->slot) == it->address &&
+                            (c.Dr7 & mask) == it->installedControl;
+                if (ours) {
+                    SetDrAddress(c, it->slot, (uintptr_t)it->oldAddress);
+                    c.Dr7 = (c.Dr7 & ~mask) | it->oldControl;
+                    if (SetThreadContext(t, &c)) done++;
+                    else keep = true;
+                }
+            } else keep = true;
+            ResumeThread(t);
+            CloseHandle(t);
+            if (keep) ++it;
+            else it = g_bpLeases.erase(it);
+        }
+        return done;
+    }
+
+    int slot = g_bpSlot.load(std::memory_order_acquire);
+    uintptr_t address = g_bpAddr.load(std::memory_order_acquire);
+    if (slot < 0 || slot >= 4 || !address) return 0;
+    DWORD64 mask = DrSlotMask(slot);
+    DWORD64 enableMask = DrEnableMask(slot);
+    DWORD64 installedControl = (1ull << (slot * 2)) |
+        ((g_bpWriteOnly.load(std::memory_order_relaxed) ? 1ull : 3ull) << (16 + slot * 4)) |
+        (3ull << (18 + slot * 4));
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
     if (snap == INVALID_HANDLE_VALUE) return 0;
     THREADENTRY32 te{ sizeof(te) };
@@ -502,11 +594,27 @@ static int SetBreakpointAllThreads(bool on) {
         if (SuspendThread(t) != (DWORD)-1) {
             CONTEXT c{}; c.ContextFlags = CONTEXT_DEBUG_REGISTERS;
             if (GetThreadContext(t, &c)) {
-                int s = g_bpSlot;
-                (&c.Dr0)[s] = on ? g_bpAddr : 0;
-                c.Dr7 &= ~((3ull << (s * 2)) | (0xFull << (16 + s * 4)));
-                if (on) c.Dr7 |= (1ull << (s * 2)) | ((g_bpWriteOnly ? 1ull : 3ull) << (16 + s * 4)) | (3ull << (18 + s * 4)); // local, (read/)write, 4 bytes
-                if (SetThreadContext(t, &c)) done++;
+                auto lease = std::find_if(g_bpLeases.begin(), g_bpLeases.end(),
+                    [&](const BpLease& x) { return x.threadId == te.th32ThreadID && x.slot == slot; });
+                if (lease != g_bpLeases.end()) {
+                    if (lease->address == address && DrAddress(c, slot) == address && (c.Dr7 & mask) == lease->installedControl) {
+                        done++;
+                        ResumeThread(t);
+                        CloseHandle(t);
+                        continue;
+                    }
+                    g_bpLeases.erase(lease);
+                }
+                if (!(c.Dr7 & enableMask)) {
+                    DWORD64 oldAddress = DrAddress(c, slot);
+                    DWORD64 oldControl = c.Dr7 & mask;
+                    SetDrAddress(c, slot, address);
+                    c.Dr7 = (c.Dr7 & ~mask) | installedControl;
+                    if (SetThreadContext(t, &c)) {
+                        g_bpLeases.push_back({ te.th32ThreadID, slot, address, oldAddress, oldControl, installedControl });
+                        done++;
+                    }
+                }
             }
             ResumeThread(t);
         }
@@ -516,22 +624,47 @@ static int SetBreakpointAllThreads(bool on) {
     return done;
 }
 
+static bool ClearBreakpointLeases() {
+    for (int attempt = 0; attempt < 5; ++attempt) {
+        SetBreakpointAllThreads(false);
+        {
+            std::lock_guard<std::mutex> leaseLock(g_bpMx);
+            if (g_bpLeases.empty()) return true;
+        }
+        Sleep(20);
+    }
+    return false;
+}
+
 static void BreakpointResearch(uintptr_t addr, int seconds) {
-    // pick a debug register nobody uses (checked on this thread's view of Dr7)
-    CONTEXT c{}; c.ContextFlags = CONTEXT_DEBUG_REGISTERS;
-    GetThreadContext(GetCurrentThread(), &c);
-    for (int s = 0; s < 4; s++) if (!(c.Dr7 & (3ull << (s * 2)))) { g_bpSlot = s; break; }
-    if (g_bpSlot < 0) { Log("research: all debug registers busy, skipping code trace"); return; }
-    g_bpAddr = addr;
+    int slot = FindFreeBreakpointSlot();
+    if (slot < 0) { Log("research: no free debug register slot, skipping code trace"); return; }
+    g_bpSlot.store(slot, std::memory_order_release);
+    g_bpAddr.store(addr, std::memory_order_release);
+    g_bpWriteOnly.store(false, std::memory_order_release);
     g_veh = AddVectoredExceptionHandler(1, BpHandler);
-    Log("research: tracing which game code touches the money for %d s (slot DR%d). Earning or spending money now helps.", seconds, g_bpSlot);
+    if (!g_veh) {
+        g_bpAddr.store(0, std::memory_order_release);
+        g_bpSlot.store(-1, std::memory_order_release);
+        Log("research: couldn't install the code-trace exception handler");
+        return;
+    }
+    Log("research: tracing which game code touches the money for %d s (slot DR%d). Earning or spending money now helps.", seconds, slot);
+    int installed = 0;
     for (int t = 0; t < seconds; t += 2) {   // re-apply so new threads are covered
-        SetBreakpointAllThreads(true);
+        installed = SetBreakpointAllThreads(true);
+        if (!installed && t == 0) Log("research: no game threads accepted the breakpoint");
         Sleep(2000);
     }
-    SetBreakpointAllThreads(false);
-    Sleep(200);
-    RemoveVectoredExceptionHandler(g_veh);
+    if (ClearBreakpointLeases()) {
+        Sleep(200);
+        RemoveVectoredExceptionHandler(g_veh);
+        g_veh = nullptr;
+        g_bpAddr.store(0, std::memory_order_release);
+        g_bpSlot.store(-1, std::memory_order_release);
+    } else {
+        Log("research: couldn't restore every debug register; keeping the exception handler active");
+    }
     int n = 0;
     for (auto& h : g_hits) {
         uint64_t rip = h.rip.load();
@@ -545,7 +678,7 @@ static void BreakpointResearch(uintptr_t addr, int seconds) {
         }
         n++;
         uint8_t code[64] = {};
-        SafeCopy(code, (void*)(rip - 32), 64);
+        gitmo_shared::SafeCopyMemory(code, (void*)(rip - 32), 64);
         char hex[200]; int p = 0;
         for (int i = 0; i < 64; i++) p += sprintf_s(hex + p, sizeof(hex) - p, i == 32 ? "|%02X" : "%02X", code[i]);
         Log("  code %s  hits %u  bytes[-32..+32] %s", Where(rip).c_str(), h.count.load(), hex);
@@ -564,7 +697,7 @@ struct StackHit {
     std::atomic<int> ready{ 0 };
     uint64_t frames[24];
     int n;
-    int32_t before, after;
+    std::atomic<int32_t> before{0}, after{0};
 };
 static StackHit g_stacks[48];
 static std::atomic<int32_t> g_watchLast{ 0 };
@@ -591,13 +724,16 @@ static int GuardedUnwind(CONTEXT* ctx, uint64_t* frames, int max) {
 }
 
 static LONG CALLBACK WatchHandler(EXCEPTION_POINTERS* e) {
-    if (e->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP || g_bpSlot < 0) return EXCEPTION_CONTINUE_SEARCH;
-    if (!(e->ContextRecord->Dr6 & (1ull << g_bpSlot))) return EXCEPTION_CONTINUE_SEARCH;
+    int slot = g_bpSlot.load(std::memory_order_acquire);
+    uintptr_t address = g_bpAddr.load(std::memory_order_acquire);
+    if (e->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP || slot < 0 || !address) return EXCEPTION_CONTINUE_SEARCH;
+    if (!(e->ContextRecord->Dr6 & (1ull << slot)) || DrAddress(*e->ContextRecord, slot) != address)
+        return EXCEPTION_CONTINUE_SEARCH;
     e->ContextRecord->Dr6 = 0;
     uint64_t rip = e->ContextRecord->Rip;
     if (rip < g_exeBase || rip >= g_exeEnd) return EXCEPTION_CONTINUE_EXECUTION;   // Gitmo's own writes
     int32_t now = 0;
-    SafeCopy(&now, (void*)g_bpAddr, 4);
+    gitmo_shared::SafeCopyMemory(&now, (void*)address, 4);
     int32_t before = g_watchLast.exchange(now);
     CONTEXT c = *e->ContextRecord;
     uint64_t fr[24];
@@ -607,29 +743,40 @@ static LONG CALLBACK WatchHandler(EXCEPTION_POINTERS* e) {
     if (!key) key = 1;
     for (auto& h : g_stacks) {
         uint64_t cur = h.key.load();
-        if (cur == key) { h.count++; h.before = before; h.after = now; break; }
+        if (cur == key) { h.count++; h.before.store(before, std::memory_order_relaxed); h.after.store(now, std::memory_order_relaxed); break; }
         if (cur == 0) {
             uint64_t zero = 0;
             if (h.key.compare_exchange_strong(zero, key)) {
-                memcpy(h.frames, fr, n * sizeof(uint64_t)); h.n = n; h.before = before; h.after = now;
+                memcpy(h.frames, fr, n * sizeof(uint64_t)); h.n = n;
+                h.before.store(before, std::memory_order_relaxed); h.after.store(now, std::memory_order_relaxed);
                 h.count++; h.ready = 1;
                 break;
             }
-            if (zero == key) { h.count++; break; }
+            if (zero == key) {
+                h.count++;
+                h.before.store(before, std::memory_order_relaxed);
+                h.after.store(now, std::memory_order_relaxed);
+                break;
+            }
         }
     }
     return EXCEPTION_CONTINUE_EXECUTION;
 }
 
 static DWORD WINAPI MoneyWatchThread(LPVOID) {
-    CONTEXT c{}; c.ContextFlags = CONTEXT_DEBUG_REGISTERS;
-    GetThreadContext(GetCurrentThread(), &c);
-    for (int s = 0; s < 4; s++) if (!(c.Dr7 & (3ull << (s * 2)))) { g_bpSlot = s; break; }
-    if (g_bpSlot < 0) { Log("money research: all debug registers busy -> off"); return 0; }
-    g_bpWriteOnly = true;
-    AddVectoredExceptionHandler(1, WatchHandler);
-    Log("money research on (MoneyResearch=1): once the balance is found, every change the game makes is traced (DR%d)", g_bpSlot);
+    int slot = FindFreeBreakpointSlot();
+    if (slot < 0) { Log("money research: no free debug register slot -> off"); return 0; }
+    g_bpSlot.store(slot, std::memory_order_release);
+    g_bpWriteOnly.store(true, std::memory_order_release);
+    PVOID handler = AddVectoredExceptionHandler(1, WatchHandler);
+    if (!handler) {
+        g_bpSlot.store(-1, std::memory_order_release);
+        Log("money research: couldn't install the exception handler -> off");
+        return 0;
+    }
+    Log("money research on (MoneyResearch=1): once the balance is found, every change the game makes is traced (DR%d)", slot);
     uint32_t logged[48] = {};
+    bool warnedNoThreads = false;
     for (;;) {
         Sleep(3000);
         uintptr_t want = 0;
@@ -637,29 +784,39 @@ static DWORD WINAPI MoneyWatchThread(LPVOID) {
             std::lock_guard<std::mutex> lk(g_mx);
             if (g_st.live && g_st.sure && g_st.selected < (int)g_st.cands.size()) want = g_st.cands[g_st.selected].addr;
         }
-        if (want != g_bpAddr) {
-            if (g_bpAddr) SetBreakpointAllThreads(false);
-            g_bpAddr = want;
-            if (want) { int32_t v = 0; SafeCopy(&v, (void*)want, 4); g_watchLast = v; Log("money research: watching %s", Where(want).c_str()); }
+        if (want != g_bpAddr.load(std::memory_order_acquire)) {
+            if (g_bpAddr.load(std::memory_order_relaxed) && !ClearBreakpointLeases()) {
+                Log("money research: couldn't restore the old breakpoint yet; will retry");
+                continue;
+            }
+            g_bpAddr.store(want, std::memory_order_release);
+            if (want) { int32_t v = 0; gitmo_shared::SafeCopyMemory(&v, (void*)want, 4); g_watchLast = v; Log("money research: watching %s", Where(want).c_str()); }
         }
-        if (g_bpAddr) SetBreakpointAllThreads(true);   // again each time: new threads
+        if (g_bpAddr.load(std::memory_order_acquire)) {
+            int installed = SetBreakpointAllThreads(true);   // again each time: new threads
+            if (!installed && !warnedNoThreads) {
+                Log("money research: no game threads accepted the breakpoint yet");
+                warnedNoThreads = true;
+            } else if (installed) warnedNoThreads = false;
+        }
         for (int i = 0; i < 48; i++) {
             StackHit& h = g_stacks[i];
             if (!h.ready.load()) continue;
             uint32_t cnt = h.count.load();
             if (cnt == logged[i]) continue;
-            if (logged[i]) { Log("money research: stack #%d again (%u times now; last %d -> %d)", i, cnt, h.before, h.after); logged[i] = cnt; continue; }
+            if (logged[i]) { Log("money research: stack #%d again (%u times now; last %d -> %d)", i, cnt, h.before.load(), h.after.load()); logged[i] = cnt; continue; }
             logged[i] = cnt;
             std::string s;
             char b[48];
             for (int k = 0; k < h.n; k++) { sprintf_s(b, "%s0x%llX", k ? " < " : "", (unsigned long long)(h.frames[k] - g_exeBase)); s += b; }
-            Log("money research: NEW stack #%d (money %d -> %d): %s", i, h.before, h.after, s.c_str());
+            Log("money research: NEW stack #%d (money %d -> %d): %s", i, h.before.load(), h.after.load(), s.c_str());
         }
     }
 }
 
 void MoneyWatch_Start() {
     if (HANDLE t = CreateThread(nullptr, 0, MoneyWatchThread, nullptr, 0, nullptr)) CloseHandle(t);
+    else Log("money research: couldn't start the watcher thread");
 }
 
 // ---- main loop ------------------------------------------------------------------
@@ -775,10 +932,14 @@ static DWORD WINAPI MoneyThread(LPVOID) {
     ULONGLONG leftAt = 0;
     auto startResearch = [](uintptr_t a) {
         if (!g_cfg.research) return;
-        static uintptr_t target;
         static bool done;
         if (done) return;
         done = true;
+        if (g_cfg.moneyResearch) {
+            Log("research: code trace skipped because MoneyResearch uses the hardware breakpoint slots");
+            return;
+        }
+        static uintptr_t target;
         target = a;
         HANDLE t = CreateThread(nullptr, 0, [](LPVOID) -> DWORD {
             Log("research: live profile record at %s:", Where(target).c_str());
@@ -796,6 +957,9 @@ static DWORD WINAPI MoneyThread(LPVOID) {
     };
     for (;;) {
         Sleep(250);
+        struct StateVersionTick {
+            ~StateVersionTick() { g_stVersion.fetch_add(1, std::memory_order_release); }
+        } stateVersionTick;
         SaveActivity();
         ULONGLONG now = GetTickCount64();
         uintptr_t s = Game_SessionId();
@@ -1034,13 +1198,18 @@ static DWORD WINAPI MoneyThread(LPVOID) {
 }
 
 static void GarageResearch(long long oldV, long long newV, std::vector<uintptr_t> skip);   // below
+#ifdef GITMO_TEST
 static int GarageCopiesUpdate(long long bal, double xp, double rank);   // below
 static int GarageBindingsUpdate(uintptr_t record, long long bal);      // below
+#endif
 void Money_Start() {
     LoadActivity();
 #ifdef GITMO_TEST
-    if (getenv("GITMO_TEST_GRES")) std::thread([] { Sleep(3000); GarageResearch(54321, 55321, {}); }).detach();   // the scan, on the harness's fake balance
-    if (getenv("GITMO_TEST_GBIND")) std::thread([] {   // run-6 copy: planted record + copy pointing at it, and a decoy
+    bool runGres = gitmo_shared::IsEnvironmentVariableSet("GITMO_TEST_GRES");
+    bool runGbind = gitmo_shared::IsEnvironmentVariableSet("GITMO_TEST_GBIND");
+    bool runGcopy = gitmo_shared::IsEnvironmentVariableSet("GITMO_TEST_GCOPY");
+    if (runGres) std::thread([] { Sleep(3000); GarageResearch(54321, 55321, {}); }).detach();   // the scan, on the harness's fake balance
+    if (runGbind) std::thread([] {   // run-6 copy: planted record + copy pointing at it, and a decoy
         int32_t* rec = (int32_t*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, 64);
         uint8_t* copy = (uint8_t*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, 64);
         uint8_t* decoy = (uint8_t*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, 64);
@@ -1052,7 +1221,7 @@ void Money_Start() {
         int32_t c, d; memcpy(&c, copy + 16, 4); memcpy(&d, decoy + 16, 4);
         Log("test: run-6 copies found %d; planted copy now %d (want 500), decoy %d (want 5500)", n, c, d);
     }).detach();
-    if (getenv("GITMO_TEST_GCOPY")) std::thread([] {   // step 2 on a planted triple (and a decoy with another rank)
+    if (runGcopy) std::thread([] {   // step 2 on a planted triple (and a decoy with another rank)
         volatile double* copy = (volatile double*)HeapAlloc(GetProcessHeap(), 0, 64);   // ordinary heap memory, like the game's
         volatile double* decoy = (volatile double*)HeapAlloc(GetProcessHeap(), 0, 64);
         copy[0] = 5500; copy[1] = 17360; copy[2] = 12; decoy[0] = 5500; decoy[1] = 17360; decoy[2] = 11;
@@ -1064,20 +1233,31 @@ void Money_Start() {
     if (HANDLE t = CreateThread(nullptr, 0, MoneyThread, nullptr, 0, nullptr)) CloseHandle(t);
 }
 
-MoneyState Money_Snapshot() { std::lock_guard<std::mutex> lk(g_mx); return g_st; }
+bool Money_Snapshot(uint64_t& version, MoneyState& out) {
+    uint64_t current = g_stVersion.load(std::memory_order_acquire);
+    if (current == version) return false;
+    std::lock_guard<std::mutex> lk(g_mx);
+    current = g_stVersion.load(std::memory_order_acquire);
+    if (current == version) return false;
+    out = g_st;
+    version = current;
+    return true;
+}
 void Money_Rescan() { g_rescan = true; }
 void Money_Select(int i) {
     std::lock_guard<std::mutex> lk(g_mx);
-    if (i >= 0 && i < (int)g_st.cands.size()) { g_st.selected = i; int32_t v; if (SafeRead32(g_st.cands[i].addr, v)) g_st.balance = v; }
+    if (i >= 0 && i < (int)g_st.cands.size()) { g_st.selected = i; int32_t v; if (SafeRead32(g_st.cands[i].addr, v)) g_st.balance = v; g_stVersion.fetch_add(1, std::memory_order_release); }
 }
 bool Money_TestAdjust(long long delta) {
     std::lock_guard<std::mutex> lk(g_mx);
     if (!g_st.live || g_st.selected >= (int)g_st.cands.size()) return false;
     uintptr_t a = g_st.cands[g_st.selected].addr;
     int32_t v;
-    if (!SafeRead32(a, v) || v + delta < 0) return false;
-    bool ok = SafeWrite32(a, (int32_t)(v + delta));
-    Log("developer test: wrote %lld to #%d %s -> %s", v + delta, g_st.selected, Where(a).c_str(), ok ? "ok" : "FAILED");
+    if (!SafeRead32(a, v)) return false;
+    if (delta < -(long long)v || delta > (long long)INT32_MAX - v) return false;
+    long long nv = (long long)v + delta;
+    bool ok = SafeWrite32(a, (int32_t)nv);
+    Log("developer test: wrote %lld to #%d %s -> %s", nv, g_st.selected, Where(a).c_str(), ok ? "ok" : "FAILED");
     return ok;
 }
 
@@ -1162,7 +1342,7 @@ static void GarageResearch(long long oldV, long long newV, std::vector<uintptr_t
     ForEachRegionWide([&](uintptr_t base, size_t size) {
         for (size_t off = 0; off < size; off += kChunk) {
             size_t n = std::min(size - off, kChunk + 64);
-            if (!SafeCopy(buf.data(), (void*)(base + off), n)) continue;
+            if (!gitmo_shared::SafeCopyMemory(buf.data(), (void*)(base + off), n)) continue;
             size_t stop = std::min(n, kChunk);
             const uint8_t* b = buf.data();
             auto add = [&](size_t i, int kind, long long num, std::string text) {
@@ -1205,7 +1385,7 @@ static void GarageResearch(long long oldV, long long newV, std::vector<uintptr_t
     }
     auto read = [&](const GHit& h, long long& nv, std::string& t) -> bool {
         uint8_t cur[64] = {};
-        if (!SafeCopy(cur, (void*)(h.kind == 4 ? h.addr - 6 : h.kind == 5 ? h.addr - 12 : h.addr), 64)) return false;   // same context as noted
+        if (!gitmo_shared::SafeCopyMemory(cur, (void*)(h.kind == 4 ? h.addr - 6 : h.kind == 5 ? h.addr - 12 : h.addr), 64)) return false;   // same context as noted
         if (h.kind >= 4) { t = GText(cur, h.kind == 5); return true; }
         if (h.kind <= 1) { int32_t x; memcpy(&x, cur, 4); nv = x; }
         else if (h.kind == 2) { double dd; memcpy(&dd, cur, 8); nv = (dd > -1e12 && dd < 1e12) ? (long long)dd : LLONG_MIN; }
@@ -1319,29 +1499,25 @@ static void GarageResearch(long long oldV, long long newV, std::vector<uintptr_t
 }
 
 
-// ---- the garage screens' copy of the balance (research step 2: GarageResearch=2) ------------
-// Research runs 1-3 (2026-11-10) found the garage screens hold the balance as three doubles
-// side by side - money, experience, rank (what the scripts' SetMoneyAndRankData passes) - read
-// when the screen opens, and checked against when you buy. After Gitmo changes the balance in a
-// garage, every such triple with this profile's experience and rank gets the current balance.
-// One worker, so quick changes can't leave an in-between amount behind: it always writes the
-// latest balance.
+// ---- legacy garage-copy scanner (test builds only) ------------------------------------------
+// The old screen-copy updater is retained only for harness tests. Production deliberately leaves
+// these copies untouched because the game can reuse their memory.
+#ifdef GITMO_TEST
 static bool SafeWriteBytes(uintptr_t a, const void* src, size_t n) {
     __try { memcpy((void*)a, src, n); return true; }
     __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
-std::atomic<int> g_garageFixCount{-1};   // phone: copies updated by the last pass (-1 none yet)
-namespace { std::atomic<bool> g_gcPending{false}, g_gcRunning{false}; }
-
 static int GarageCopiesUpdate(long long bal, double xp, double rank) {
     std::vector<uintptr_t> found;
     const size_t kChunk = 1 << 20;
     std::vector<uint8_t> buf(kChunk + 32);
     ULONGLONG t0 = GetTickCount64();
+    std::lock_guard<std::mutex> scanLock(g_scanMx);
+    CollectStacks();
     ForEachRegion([&](uintptr_t base, size_t size) {
         for (size_t off = 0; off < size; off += kChunk) {
             size_t n = std::min(size - off, kChunk + 32);
-            if (!SafeCopy(buf.data(), (void*)(base + off), n)) continue;
+            if (!gitmo_shared::SafeCopyMemory(buf.data(), (void*)(base + off), n)) continue;
             size_t stop = std::min(n, kChunk);
             for (size_t i = 8; i + 16 <= n && i < stop + 8; i += 8) {   // i = the experience; money just before, rank just after
                 double x, r, m;
@@ -1357,7 +1533,7 @@ static int GarageCopiesUpdate(long long bal, double xp, double rank) {
     double nv = (double)bal;
     for (uintptr_t a : found) {
         double cur[3];
-        if (!SafeCopy(cur, (void*)a, 24) || cur[1] != xp || cur[2] != rank) continue;
+        if (!gitmo_shared::SafeCopyMemory(cur, (void*)a, 24) || cur[1] != xp || cur[2] != rank) continue;
         if (cur[0] == nv) { already++; continue; }
         if (SafeWriteBytes(a, &nv, 8)) { written++; Log("garage copies: %s %.0f -> %lld", Where(a).c_str(), cur[0], bal); }
     }
@@ -1373,17 +1549,18 @@ static int GarageCopiesUpdate(long long bal, double xp, double rank) {
 //   -0x10  pointer to the live profile record (the balance Gitmo changes)
 //   -0x08  8, 0x18 (two int32: where experience and rank sit in that record)
 //   +0x00  the balance as the screen last read it (int32)
-// Writing the current balance there keeps the screen honest. Found by the pointer, so only
-// records that belong to this exact balance are touched.
+// The old writer is retained only for harness tests; production does not change these records.
 static int GarageBindingsUpdate(uintptr_t record, long long bal) {
     std::vector<uintptr_t> found;
     const size_t kChunk = 1 << 20;
     std::vector<uint8_t> buf(kChunk + 32);
     ULONGLONG t0 = GetTickCount64();
+    std::lock_guard<std::mutex> scanLock(g_scanMx);
+    CollectStacks();
     ForEachRegion([&](uintptr_t base, size_t size) {
         for (size_t off = 0; off < size; off += kChunk) {
             size_t n = std::min(size - off, kChunk + 32);
-            if (!SafeCopy(buf.data(), (void*)(base + off), n)) continue;
+            if (!gitmo_shared::SafeCopyMemory(buf.data(), (void*)(base + off), n)) continue;
             size_t stop = std::min(n, kChunk);
             for (size_t i = 0; i + 24 <= n && i < stop; i += 8) {
                 uint64_t ptr; memcpy(&ptr, buf.data() + i, 8);
@@ -1407,27 +1584,7 @@ static int GarageBindingsUpdate(uintptr_t record, long long bal) {
         found.size(), found.size() == 1 ? "y" : "ies", Where(record).c_str(), written, bal, already, GetTickCount64() - t0);
     return (int)found.size();
 }
-
-static void GarageCopiesSoon() {   // called with g_mx held, after a change in a garage
-    g_gcPending = true;
-    if (g_gcRunning.exchange(true)) return;
-    std::thread([] {
-        while (g_gcPending.exchange(false)) {
-            long long bal; double xp = -1, rank = -1; uintptr_t record = 0;
-            {
-                std::lock_guard<std::mutex> lk(g_mx);
-                if (!g_st.live || g_st.selected >= (int)g_st.cands.size()) break;
-                const Candidate& c = g_st.cands[g_st.selected];
-                int32_t x, r;
-                if (!SafeRead32(c.addr + c.xpOff, x) || !SafeRead32(c.addr + c.rankOff, r)) break;
-                bal = g_st.balance; xp = x; rank = r; record = c.addr;
-            }
-            g_garageFixCount = GarageBindingsUpdate(record, bal);   // the copy the screens check (run 6)
-        }
-        g_gcRunning = false;
-        if (g_gcPending) { std::lock_guard<std::mutex> lk(g_mx); GarageCopiesSoon(); }   // a change came in as it finished
-    }).detach();
-}
+#endif
 
 static void MaybeGarageResearch(long long oldV, long long newV) {   // called with g_mx held
     // (research step 2 - writing the balance into screen copies - is switched off for good: it didn't
@@ -1446,8 +1603,12 @@ bool Money_Apply(long long delta, const std::string& label) {
     Candidate& c = g_st.cands[g_st.selected];
     int32_t v;
     if (!StillProfile(c.addr, 0, v)) { Log("transfer: profile record gone -> not changed"); return false; }
+    if (delta > 2147483647LL - v || delta < (long long)kMinMoney - v) {
+        Log("transfer: %lld %+lld is out of range -> not changed", (long long)v, delta);
+        return false;
+    }
     long long nv = (long long)v + delta;
-    if ((delta < 0 && nv < 0) || nv < kMinMoney || nv > 2147483647LL) { Log("transfer: %lld %+lld is out of range -> not changed", (long long)v, delta); return false; }
+    if (delta < 0 && nv < 0) { Log("transfer: %lld %+lld is out of range -> not changed", (long long)v, delta); return false; }
     // Group mode: every copy must still hold the same amount, then all of them change together.
     std::vector<Candidate*> targets{ &c };
     if (g_st.group) {
@@ -1459,8 +1620,25 @@ bool Money_Apply(long long delta, const std::string& label) {
             targets.push_back(&o);
         }
     }
-    for (Candidate* t : targets)
-        if (!SafeWrite32(t->addr, (int32_t)nv)) { Log("transfer: write failed at %s", Where(t->addr).c_str()); return false; }
+    size_t written = 0;
+    for (; written < targets.size(); ++written) {
+        if (SafeWrite32(targets[written]->addr, (int32_t)nv)) continue;
+        uintptr_t failedAt = targets[written]->addr;
+        bool rollbackOk = true;
+        while (written > 0) {
+            --written;
+            if (!SafeWrite32(targets[written]->addr, v)) rollbackOk = false;
+        }
+        Log("transfer: write failed at %s%s", Where(failedAt).c_str(),
+            rollbackOk ? "; prior copies restored" : "; rollback incomplete, checking balance again");
+        if (!rollbackOk) {
+            g_st.sure = false;
+            g_st.group = false;
+            g_st.status = "Balance update incomplete; checking again";
+            g_rescan = true;
+        }
+        return false;
+    }
     // Tell the tracker this change is ours, so it shows up once, with its label.
     for (Candidate* t : targets) t->value = nv;
     if (targets.size() > 1) Log("transfer: changed all %zu copies of the balance", targets.size());

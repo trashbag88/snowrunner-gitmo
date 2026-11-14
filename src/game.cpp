@@ -9,25 +9,38 @@
 // a game update moves them (then set EngineOffset / GarageOffset in Gitmo.ini).
 
 #include "gitmo.h"
+#include "shared.h"
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <cstdint>
+#include <cmath>
 #include <algorithm>
-#include <map>
+#include <atomic>
+#include <mutex>
+#include <vector>
 
-static bool SafeCopyG(void* dst, const void* src, size_t n) {
-    __try { memcpy(dst, src, n); return true; }
-    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
-}
 // Addresses below 64 KB are never valid (a null pointer plus an offset): skip them instead of
 // letting the read fault - a caught fault is harmless, but other mods' crash loggers report it.
-template <class T> static bool Rd(uintptr_t a, T& v) { return a >= 0x10000 && SafeCopyG(&v, (void*)a, sizeof(T)); }
+template <class T> static bool Rd(uintptr_t a, T& v) { return a >= 0x10000 && gitmo_shared::SafeCopyMemory(&v, (void*)a, sizeof(T)); }
 
 // ---- finding the truck-control global ----------------------------------------------------
-static uintptr_t g_truckCtrlGlobal;   // address of the global pointer
+static std::atomic<uintptr_t> g_truckCtrlGlobal{0};   // address of the global pointer (set once, by GameThread)
+static std::atomic<bool> g_stop{false};
 
+// Looks for pat (-1 = any byte) in b[0..n). Returns the last match; count is raised by every match
+// (set to 99 if the memory can't be read, which also makes the result "not unique").
 static uintptr_t ScanRange(const uint8_t* b, size_t n, const int* pat, size_t pn, int& count) {
     uintptr_t found = 0;
+    if (!pn || n < pn) return 0;
     __try {
-        for (size_t k = 0; k + pn <= n; k++) {
+        const size_t last = n - pn;
+        for (size_t k = 0; k <= last; k++) {
+            if (pat[0] >= 0) {   // jump straight to the next place the first byte occurs
+                const void* p = memchr(b + k, pat[0], last - k + 1);
+                if (!p) break;
+                k = (size_t)((const uint8_t*)p - b);
+            }
             size_t j = 0;
             while (j < pn && (pat[j] < 0 || b[k + j] == pat[j])) j++;
             if (j == pn) { found = (uintptr_t)(b + k); count++; }
@@ -36,14 +49,20 @@ static uintptr_t ScanRange(const uint8_t* b, size_t n, const int* pat, size_t pn
     return found;
 }
 
+// "40 53 ? ? 48": hex bytes, '?' = any byte. Returns the one place it occurs in the exe's code, or 0.
 static uintptr_t FindPattern(const char* sig) {
     std::vector<int> pat;
     for (const char* p = sig; *p;) {
         while (*p == ' ') p++;
         if (!*p) break;
-        if (*p == '?') { pat.push_back(-1); p++; continue; }
-        pat.push_back((int)strtol(p, (char**)&p, 16));
+        if (*p == '?') { pat.push_back(-1); while (*p == '?') p++; continue; }
+        char* end = nullptr;
+        long v = strtol(p, &end, 16);
+        if (end == p || v < 0 || v > 255) { Log("game: bad byte pattern \"%s\"", sig); return 0; }
+        pat.push_back((int)v);
+        p = end;
     }
+    if (pat.empty()) return 0;
     auto nt = (IMAGE_NT_HEADERS*)(g_exeBase + ((IMAGE_DOS_HEADER*)g_exeBase)->e_lfanew);
     auto sec = IMAGE_FIRST_SECTION(nt);
     uintptr_t found = 0; int count = 0;
@@ -63,8 +82,10 @@ static uintptr_t LocateTruckControl() {
     uintptr_t callee = at + 9 + 5 + rel;
     // callee is "lea rax, [rip+disp32]; ret"
     uint8_t c[8];
-    if (!SafeCopyG(c, (void*)callee, 8) || c[0] != 0x48 || c[1] != 0x8D || c[2] != 0x05 || c[7] != 0xC3) return 0;
-    return callee + 7 + *(int32_t*)(c + 3);
+    if (!gitmo_shared::SafeCopyMemory(c, (void*)callee, 8) || c[0] != 0x48 || c[1] != 0x8D || c[2] != 0x05 || c[7] != 0xC3) return 0;
+    int32_t disp; memcpy(&disp, c + 3, 4);
+    uintptr_t g = callee + 7 + disp;
+    return (g > g_exeBase && g + 8 <= g_exeEnd) ? g : 0;   // must be a global inside the exe
 }
 
 // SnowRunner's own "key is down" table: 256 bytes indexed by Windows key code, filled by the
@@ -79,7 +100,7 @@ uintptr_t Game_FindKeyTable() {
 
 // The game loads XInput itself and keeps the address of XInputGetState in globals:
 //   lea rdx, ["XInputGetState"]; ...; call [GetProcAddress]; mov [global], rax
-// Returns those globals (up to max), found from the name string, so a game update that
+// Returns those globals (up to max, each once), found from the name string, so a game update that
 // moves the code still works.
 int Game_FindXInputSlots(uintptr_t* out, int max) {
     auto nt = (IMAGE_NT_HEADERS*)(g_exeBase + ((IMAGE_DOS_HEADER*)g_exeBase)->e_lfanew);
@@ -106,7 +127,9 @@ int Game_FindXInputSlots(uintptr_t* out, int max) {
                 for (size_t j = k + 7; j < k + 7 + 32; j++)                                // the "mov [rip+disp32], rax" after the call
                     if (b[j] == 0x48 && b[j + 1] == 0x89 && b[j + 2] == 0x05) {
                         uintptr_t g = (uintptr_t)(b + j + 7) + *(const int32_t*)(b + j + 3);
-                        if (g > g_exeBase && g + 8 <= g_exeEnd) out[n++] = g;
+                        bool dup = false;
+                        for (int q = 0; q < n; q++) if (out[q] == g) dup = true;
+                        if (!dup && g > g_exeBase && g + 8 <= g_exeEnd) out[n++] = g;
                         break;
                     }
             }
@@ -121,12 +144,14 @@ static std::atomic<bool> g_tcSearchDone{false};
 // a new object for every load (checked 2026-11-09 by loading two saves from the menu).
 uintptr_t Game_SessionId() {
 #ifdef GITMO_TEST
-    return getenv("GITMO_TEST_MENU") ? 0 : 1;   // the test harness has no game: "a save is loaded" unless testing the main menu
-#endif
-    if (!g_truckCtrlGlobal) return g_tcSearchDone ? 1 : 0;   // not found (game update?): never block anything
+    return gitmo_shared::IsEnvironmentVariableSet("GITMO_TEST_MENU") ? 0 : 1;   // the test harness has no game: "a save is loaded" unless testing the main menu
+#else
+    uintptr_t global = g_truckCtrlGlobal;
+    if (!global) return g_tcSearchDone ? 1 : 0;   // not found (game update?): never block anything
     uintptr_t tc = 0;
-    if (!Rd(g_truckCtrlGlobal, tc)) return 0;
+    if (!Rd(global, tc)) return 0;
     return tc;
+#endif
 }
 bool Game_InGame() { return Game_SessionId() != 0; }
 
@@ -137,18 +162,18 @@ uintptr_t Game_CurrentVehicle() {
 }
 
 // ---- engine / garage ----------------------------------------------------------------------
-static int g_engineOff = -1, g_garageOff = -1;
+static int g_engineOff = -1, g_garageOff = -1;   // set once in Game_Start, before the thread starts
 
-int Game_EngineRunning() {   // 1 yes, 0 no, -1 unknown / no truck
-    uintptr_t veh = Game_CurrentVehicle();
+static int EngineRunningOf(uintptr_t veh) {   // 1 yes, 0 no, -1 unknown / no truck
     uint8_t v = 0;
     if (!veh || g_engineOff < 0 || !Rd(veh + g_engineOff, v)) return -1;
     // The byte is a set of flags: the low two bits are the engine (3 = running, 0 = off); the
     // others are separate states (seen while driving: 0x83, 0x0F, 0x1F, 0x2F), so only those two count.
-    static uint8_t seen[256];
-    if (!seen[v]) { seen[v] = 1; Log("game: engine state byte 0x%02X -> engine %s", v, (v & 3) ? "running" : "off"); }
+    static std::atomic<bool> seen[256];
+    if (!seen[v].exchange(true)) Log("game: engine state byte 0x%02X -> engine %s", v, (v & 3) ? "running" : "off");
     return (v & 3) != 0 ? 1 : 0;
 }
+int Game_EngineRunning() { return EngineRunningOf(Game_CurrentVehicle()); }
 
 int Game_InGarage() {
     uintptr_t tc = 0;
@@ -163,6 +188,7 @@ struct Snap { int kind; std::vector<uint8_t> veh, ta, tc, data; uintptr_t vehAdd
 static std::mutex g_snapLock;
 static std::vector<Snap> g_snaps;
 static uintptr_t g_dataStart, g_dataSize;   // the exe's writable section(s)
+static const int kMaxMarksPerKind = 4;      // garage / driving marks hold up to 64 MB each: keep the newest few
 
 static void FindDataSection() {
     auto nt = (IMAGE_NT_HEADERS*)(g_exeBase + ((IMAGE_DOS_HEADER*)g_exeBase)->e_lfanew);
@@ -174,19 +200,34 @@ static void FindDataSection() {
     if (g_dataSize > (64u << 20)) g_dataSize = 64u << 20;
 }
 
+// Copies n bytes; what can't be read stays 0xCD. Reads page by page, so one unreadable page
+// doesn't lose the readable bytes next to it.
 static std::vector<uint8_t> Grab(uintptr_t a, size_t n) {
     std::vector<uint8_t> v(n, 0xCD);
-    if (a) for (size_t off = 0; off < n; off += 0x1000) SafeCopyG(&v[off], (void*)(a + off), std::min<size_t>(0x1000, n - off));
+    if (!a) return v;
+    for (size_t off = 0; off < n;) {
+        size_t chunk = std::min<size_t>(n - off, 0x1000 - ((a + off) & 0xFFF));
+        gitmo_shared::SafeCopyMemory(&v[off], (void*)(a + off), chunk);
+        off += chunk;
+    }
     return v;
 }
 
 static const char* kKindNames[] = { "ENGINE ON", "ENGINE OFF", "IN GARAGE", "DRIVING (not garage)" };
 
-static void Analyse(int a, int b, const char* what, std::vector<uint8_t> Snap::*field, uintptr_t base, bool exeRel) {
+// Bytes of `field` that have one value in every mark of kind a and another in every mark of kind b.
+// sameTruck: only marks taken in that vehicle (an engine byte means nothing across different trucks).
+static void Analyse(int a, int b, const char* what, std::vector<uint8_t> Snap::*field, uintptr_t base, bool exeRel, bool sameTruck = false, uintptr_t veh = 0) {
+    if (a < 0 || a >= (int)(sizeof kKindNames / sizeof kKindNames[0]) ||
+        b < 0 || b >= (int)(sizeof kKindNames / sizeof kKindNames[0])) return;
     std::vector<const Snap*> A, B;
-    for (auto& s : g_snaps) { if (s.kind == a) A.push_back(&s); if (s.kind == b) B.push_back(&s); }
+    for (auto& s : g_snaps) {
+        if (sameTruck && s.vehAddr != veh) continue;
+        if (s.kind == a) A.push_back(&s);
+        if (s.kind == b) B.push_back(&s);
+    }
     if (A.empty() || B.empty()) return;
-    size_t n = (A[0]->*field).size();
+    size_t n = std::min((A[0]->*field).size(), (B[0]->*field).size());
     int shown = 0;
     for (size_t i = 0; i < n && shown < 40; i++) {
         uint8_t va = (A[0]->*field)[i], vb = (B[0]->*field)[i];
@@ -203,6 +244,7 @@ static void Analyse(int a, int b, const char* what, std::vector<uint8_t> Snap::*
 }
 
 void Game_Mark(int kind) {   // 0 engine on, 1 engine off, 2 in garage, 3 driving
+    if (kind < 0 || kind > 3) return;
     uintptr_t tc = 0, veh = 0, ta = 0;
     Rd(g_truckCtrlGlobal, tc); Rd(tc + 8, veh); Rd(veh + 0x68, ta);
     Snap s; s.kind = kind; s.vehAddr = veh;
@@ -210,19 +252,20 @@ void Game_Mark(int kind) {   // 0 engine on, 1 engine off, 2 in garage, 3 drivin
     if (kind >= 2) s.data = Grab(g_dataStart, g_dataSize);
     std::lock_guard<std::mutex> lk(g_snapLock);
     g_snaps.push_back(std::move(s));
+    int same = 0;
+    for (auto& x : g_snaps) if (x.kind == kind) same++;
+    for (auto it = g_snaps.begin(); same > kMaxMarksPerKind && it != g_snaps.end();) {   // drop this kind's oldest
+        if (it->kind == kind) { it = g_snaps.erase(it); same--; } else ++it;
+    }
     int counts[4] = {};
     for (auto& x : g_snaps) counts[x.kind]++;
     Log("mark: %s (truck %p) - marks so far: on %d, off %d, garage %d, driving %d", kKindNames[kind], (void*)veh,
         counts[0], counts[1], counts[2], counts[3]);
     if (kind <= 1 && counts[0] && counts[1]) {
-        // only compare snapshots of the same truck
         Log("research: bytes that follow ENGINE ON / OFF (same truck only):");
-        std::vector<Snap> keep = g_snaps;
-        g_snaps.erase(std::remove_if(g_snaps.begin(), g_snaps.end(), [&](const Snap& x) { return x.kind <= 1 && x.vehAddr != veh; }), g_snaps.end());
-        Analyse(0, 1, "vehicle", &Snap::veh, 0, false);
-        Analyse(0, 1, "truckaction", &Snap::ta, 0, false);
-        Analyse(0, 1, "truckcontrol", &Snap::tc, 0, false);
-        g_snaps = keep;
+        Analyse(0, 1, "vehicle", &Snap::veh, 0, false, true, veh);
+        Analyse(0, 1, "truckaction", &Snap::ta, 0, false, true, veh);
+        Analyse(0, 1, "truckcontrol", &Snap::tc, 0, false, true, veh);
     }
     if (kind >= 2 && counts[2] && counts[3]) {
         Log("research: bytes that follow IN GARAGE / DRIVING:");
@@ -243,52 +286,79 @@ int Game_MarkCount(int kind) {
 // while no truck is loaded (main menu, loading) or the state is unknown.
 static std::atomic<float> g_battMin{15.0f};
 static std::atomic<int> g_battState{0};   // 0 unknown/paused, 1 charging, 2 on battery
+static std::mutex g_battLock;
 const float kBatteryMinutes = 15.0f;
+static const ULONGLONG kMaxStepMs = 5000;   // a longer gap between two checks (PC asleep, game frozen) counts as no time at all
 
 float Battery_Minutes() { return g_battMin; }
 void Battery_Set(float minutes) {   // developer test buttons
     minutes = std::min(std::max(minutes, 0.0f), kBatteryMinutes);
-    g_battMin = minutes;
-    SaveBattery(minutes);
+    {
+        std::lock_guard<std::mutex> lk(g_battLock);
+        g_battMin = minutes;
+        SaveBattery(minutes);
+    }
     Log("battery: set to %.2f min by the developer buttons", minutes);
 }
 int Battery_State() { return g_battState; }
 
 static DWORD WINAPI GameThread(LPVOID) {
     FindDataSection();
-    for (int i = 0; i < 120 && !g_truckCtrlGlobal; i++) {   // the code is decrypted shortly after start
+    for (int i = 0; i < 120 && !g_stop; i++) {   // the code is decrypted shortly after start
+        uintptr_t g = LocateTruckControl();
+        if (g) { g_truckCtrlGlobal = g; break; }
         Sleep(1000);
-        g_truckCtrlGlobal = LocateTruckControl();
     }
     g_tcSearchDone = true;
-    if (g_truckCtrlGlobal) Log("game: truck control global at exe+0x%llX", (unsigned long long)(g_truckCtrlGlobal - g_exeBase));
+    uintptr_t global = g_truckCtrlGlobal;
+    if (global) Log("game: truck control global at exe+0x%llX", (unsigned long long)(global - g_exeBase));
     else Log("game: truck control global NOT found -> battery stays as it is; the phone opens anywhere");
     ULONGLONG last = GetTickCount64(), lastSave = last;
+    float lastSaved = g_battMin;
     int lastState = -1;
-    for (;;) {
+    while (!g_stop) {
         Sleep(500);
         ULONGLONG now = GetTickCount64();
-        float dtMin = (now - last) / 60000.0f;
+        ULONGLONG stepMs = now - last;
         last = now;
-        int eng = Game_EngineRunning(), gar = Game_InGarage();
+        if (stepMs > kMaxStepMs) stepMs = 0;
+        float dtMin = stepMs / 60000.0f;
+        uintptr_t veh = Game_CurrentVehicle();
+        int eng = EngineRunningOf(veh), gar = Game_InGarage();
         int st = 0;
-        if (Game_CurrentVehicle() || gar == 1) {
+        if (veh || gar == 1) {
             if (eng == 1 || gar == 1) st = 1;
             else if (eng == 0) st = 2;
         }
-        float m = g_battMin;
-        if (st == 1) m = std::min(kBatteryMinutes, m + 2 * dtMin);
-        if (st == 2) m = std::max(0.0f, m - dtMin);
-        g_battMin = m;
+        float delta = st == 1 ? 2 * dtMin : st == 2 ? -dtMin : 0.0f;
+        float m;
+        {
+            std::lock_guard<std::mutex> lk(g_battLock);
+            m = g_battMin;
+            if (delta != 0.0f) {
+                m = std::min(kBatteryMinutes, std::max(0.0f, m + delta));
+                g_battMin = m;
+            }
+            if (now - lastSave > 30000) {
+                lastSave = now;
+                if (fabsf(m - lastSaved) > 0.005f) { SaveBattery(m); lastSaved = m; }   // nothing to write while paused
+            }
+        }
         g_battState = st;
         if (st != lastState) { Log("battery: %s (%.1f min left)", st == 1 ? "charging" : st == 2 ? "on battery" : "paused (no truck / state unknown)", m); lastState = st; }
-        if (now - lastSave > 30000) { lastSave = now; SaveBattery(m); }
     }
+    return 0;
 }
 
 void Game_Start() {
-    g_battMin = std::min(std::max(g_cfg.batteryMin, 0.0f), kBatteryMinutes);
+    {
+        std::lock_guard<std::mutex> lk(g_battLock);
+        g_battMin = std::min(std::max(g_cfg.batteryMin, 0.0f), kBatteryMinutes);
+    }
     g_engineOff = g_cfg.engineOffset;
     g_garageOff = g_cfg.garageOffset;
     if (HANDLE t = CreateThread(nullptr, 0, GameThread, nullptr, 0, nullptr)) CloseHandle(t);
 }
+
+// Signal the worker to finish; don't wait here because this can be called under the loader lock.
+void Game_Stop() { g_stop = true; }
