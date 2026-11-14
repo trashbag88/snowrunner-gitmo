@@ -68,7 +68,23 @@ std::string Steam_PersonaName() {
 }
 
 // ---- helpers ----------------------------------------------------------------------
-static ImDrawList* DL() { return ImGui::GetWindowDrawList(); }
+static ImDrawList* g_drawListOverride;
+static ImDrawList* DL() { return g_drawListOverride ? g_drawListOverride : ImGui::GetWindowDrawList(); }
+class ScopedDrawListOverride {
+public:
+    ScopedDrawListOverride(ImDrawList* drawList, ImVec2 clipMin, ImVec2 clipMax)
+        : previous_(g_drawListOverride), drawList_(drawList) {
+        drawList_->PushClipRect(clipMin, clipMax, true);
+        g_drawListOverride = drawList_;
+    }
+    ~ScopedDrawListOverride() {
+        drawList_->PopClipRect();
+        g_drawListOverride = previous_;
+    }
+private:
+    ImDrawList* previous_;
+    ImDrawList* drawList_;
+};
 
 static ImVec2 Measure(ImFont* f, float size, const char* t) { return f->CalcTextSizeA(size, FLT_MAX, 0, t); }
 static void Text(ImFont* f, float size, ImVec2 p, ImU32 c, const char* t) { DL()->AddText(f, size, p, c, t); }
@@ -792,6 +808,9 @@ static const tx::Incoming* IncomingToShow() {
 }
 
 static void IncomingSheet(const tx::Incoming& in, ImVec2 a, ImVec2 b) {
+    // SMS messages are child-window content, which ImGui renders above its parent window.
+    // Draw the modal in the foreground so inline photos cannot cover the transfer notice.
+    ScopedDrawListOverride drawOnTop(ImGui::GetForegroundDrawList(), a, b);
     DL()->AddRectFilled(a, b, IM_COL32(0, 0, 0, 120), 34 * s);
     float h = 360 * s;
     ImVec2 p0(a.x, b.y - h), p1 = b;
@@ -844,7 +863,7 @@ static void IncomingSheet(const tx::Incoming& in, ImVec2 a, ImVec2 b) {
 }
 
 #ifdef GITMO_TEST
-// Fake transfers for screenshot phases 9-14 and the receive-overlay regression at 46.
+// Fake transfers for screenshot phases 9-14 and the SMS-photo overlay regression at 46.
 static TxView DemoTx(int phase) {
     TxView v; v.ready = true;
     uint64_t now = GetTickCount64();
@@ -2214,12 +2233,13 @@ void UI_Draw() {
     static int lastPhase = -1;
     int phase = g_testFrame / 300;   // 0 drawer, 1 gitmo, 2 activity, 3 settings, 4 sheet, 5 dark drawer cracked, 6 dark settings cracked, 7 dead, 8 dead charging
                                      // 9 send: pick, 10 amount, 11 waiting, 12 incoming request (dark), 13 sent, 14 received over the drawer
-                                     // 46 received-transfer sheet over an open SMS chat
+                                     // 46 received-transfer sheet over SMS chat with inline photos
     if (phase != lastPhase && phase >= 35) {
         lastPhase = phase;
         g_sheet = false; g_captureKey = false; g_cfg.cracked = false; g_chat = 0; g_emojiOpen = false; g_photoUi = PhNone;
         g_app = phase == 35 ? Drawer : phase == 43 || phase == 46 ? SmsApp : phase == 44 ? GitmoApp : RadioApp;
         if (phase == 43 || phase == 46) g_chat = 2;
+        if (phase == 46) TestPhotos();
         if (phase == 44) g_screen = Home;
         g_radShare = phase == 41;
         g_radTab = phase == 40 ? 1 : 0; g_radEdit = phase == 36 ? false : g_radEdit;
