@@ -180,7 +180,9 @@ static bool RadField(const char* id, char* buf, size_t n, ImVec2 a, ImVec2 b, co
     ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(0, 0));
     ImGui::SetNextItemWidth(b.x - a.x - 22 * s);
     if (focus && !g_behindSheet) { ImGui::SetKeyboardFocusHere(); focus = false; }
-    bool enter = !g_behindSheet && ImGui::InputText(id, buf, n, ImGuiInputTextFlags_EnterReturnsTrue);
+    ImGui::BeginDisabled(g_behindSheet);
+    bool enter = ImGui::InputText(id, buf, n, ImGuiInputTextFlags_EnterReturnsTrue);
+    ImGui::EndDisabled();
     bool active = ImGui::IsItemActive();
     ImGui::PopStyleVar();
     ImGui::PopStyleColor(5);
