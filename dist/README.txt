@@ -1,5 +1,5 @@
 ===============================================================================
-  Gitmo for SnowRunner  v0.9.11 (transfers, text messages, photos and radio)
+  Gitmo for SnowRunner  v0.9.12 (transfers, text messages, photos and radio)
 ===============================================================================
 
 WHAT IT IS

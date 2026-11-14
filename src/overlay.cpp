@@ -11,8 +11,11 @@
 //    overlay switches itself off and the game carries on.
 
 #include "gitmo.h"
+#include "shared.h"
 #include <cmath>
 #include <algorithm>
+#include <cstdint>
+#include <new>
 #include <d3d11.h>
 #include <dxgi1_2.h>
 #include "imgui.h"
@@ -42,35 +45,53 @@ static ResizeBuffers_t o_ResizeBuffers;
 
 static std::atomic<IDXGISwapChain*> g_sc{nullptr};
 static HWND g_hwnd;
-static WNDPROC g_origWndProc;
+static std::atomic<WNDPROC> g_origWndProc{nullptr};
 static ID3D11Device* g_dev;
 static ID3D11DeviceContext* g_ctx;
 static ID3D11RenderTargetView* g_rtv;
-static bool g_imguiReady, g_broken, g_keyWasDown;
+static std::atomic<bool> g_imguiReady{false}, g_broken{false};
+static bool g_keyWasDown;
 static UINT g_bbW, g_bbH;   // size of the frame the game actually draws
 static std::mutex g_uiLock;
+static std::mutex g_patchLock;
+static std::mutex g_attachLock;
 
 // Replace one function-table entry. What was there before is stored in *orig first,
 // and only then is the entry switched (in one step), so a call racing the patch
 // always finds a valid original.
 template <class F>
 static bool PatchSlot(void** vt, int idx, void* fn, F* orig) {
-    void* prev = vt[idx];
-    if (prev == fn) return false;
-    *(void* volatile*)orig = prev;
-    MemoryBarrier();
+    if (!vt || idx < 0 || !fn || !orig) return false;
+    std::lock_guard<std::mutex> lk(g_patchLock);
     DWORD old;
     if (!VirtualProtect(&vt[idx], sizeof(void*), PAGE_READWRITE, &old)) return false;
-    InterlockedExchangePointer(&vt[idx], fn);
-    VirtualProtect(&vt[idx], sizeof(void*), old, &old);
-    return true;
+    void* volatile* slot = (void* volatile*)&vt[idx];
+    bool installed = false;
+    for (int attempt = 0; attempt < 8; ++attempt) {
+        void* prev = InterlockedCompareExchangePointer(slot, nullptr, nullptr);
+        if (prev == fn) { installed = true; break; }
+        *(void* volatile*)orig = prev;
+        MemoryBarrier();
+        if (InterlockedCompareExchangePointer(slot, fn, prev) == prev) {
+            installed = true;
+            break;
+        }
+    }
+    DWORD ignored;
+    if (!VirtualProtect(&vt[idx], sizeof(void*), old, &ignored))
+        Log("overlay: couldn't restore vtable protection");
+    return installed;
 }
 
 // ---- textures for the phone (Steam avatars) ------------------------------------
 // Called from the phone's drawing (render thread, device known). The device is free-threaded
 // for creation; the view is used as an ImGui texture id.
 void* Overlay_MakeTexture(const uint8_t* rgba, int w, int h) {
-    if (!g_dev || !rgba || w <= 0 || h <= 0) return nullptr;
+    if (!g_dev || !rgba || w <= 0 || h <= 0 ||
+        w > D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION ||
+        h > D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION ||
+        (uint64_t)w * 4 > UINT_MAX ||
+        (uint64_t)w * h * 4 > 256ull * 1024 * 1024) return nullptr;
     D3D11_TEXTURE2D_DESC d{};
     d.Width = w; d.Height = h; d.MipLevels = 1; d.ArraySize = 1; d.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     d.SampleDesc.Count = 1; d.Usage = D3D11_USAGE_IMMUTABLE; d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
@@ -87,51 +108,127 @@ void Overlay_FreeTexture(void* srv) { if (srv) ((ID3D11ShaderResourceView*)srv)-
 
 // ---- photo capture: the game's frame, before the phone is drawn onto it ------------------
 static std::atomic<bool> g_captureReq{false};
+struct PendingCapture {
+    ID3D11Texture2D* staging = nullptr;
+    UINT width = 0, height = 0;
+    bool bgra = false, rgba = false, ten = false;
+};
+static PendingCapture g_pendingCapture;
+static ID3D11Texture2D* g_captureMapped;
+static bool g_captureActive;
+
 void Overlay_RequestCapture() { g_captureReq = true; }
 
+static void CaptureFailed() {
+    g_captureActive = false;
+    Photo_Failed();
+}
+
+static void DiscardPendingCapture() {
+    if (g_captureMapped && g_ctx) {
+        g_ctx->Unmap(g_captureMapped, 0);
+        g_captureMapped = nullptr;
+    }
+    if (g_pendingCapture.staging) g_pendingCapture.staging->Release();
+    g_pendingCapture = {};
+}
+
 static void CaptureFrame(IDXGISwapChain* sc) {
+    if (g_pendingCapture.staging) DiscardPendingCapture();
     ID3D11Texture2D* bb = nullptr;
-    if (FAILED(sc->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)&bb)) || !bb) { Log("photo: couldn't read the game's frame"); Photo_Failed(); return; }
+    if (FAILED(sc->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)&bb)) || !bb) { Log("photo: couldn't read the game's frame"); CaptureFailed(); return; }
     D3D11_TEXTURE2D_DESC d{}; bb->GetDesc(&d);
+    if (!d.Width || !d.Height || d.Width > D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION ||
+        d.Height > D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION) {
+        Log("photo: game frame dimensions are invalid (%ux%u)", d.Width, d.Height);
+        bb->Release(); CaptureFailed(); return;
+    }
+    uint64_t bytes = (uint64_t)d.Width * d.Height * 4;
+    if (bytes > 256ull * 1024 * 1024) {
+        Log("photo: game frame is too large to capture (%ux%u)", d.Width, d.Height);
+        bb->Release(); CaptureFailed(); return;
+    }
     DXGI_FORMAT f = d.Format;
     bool bgra = f == DXGI_FORMAT_B8G8R8A8_UNORM || f == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB || f == DXGI_FORMAT_B8G8R8X8_UNORM;
     bool rgba = f == DXGI_FORMAT_R8G8B8A8_UNORM || f == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
     bool ten = f == DXGI_FORMAT_R10G10B10A2_UNORM;
-    if (!bgra && !rgba && !ten) { Log("photo: the game's frame format %d isn't supported", (int)f); bb->Release(); Photo_Failed(); return; }
+    if (!bgra && !rgba && !ten) { Log("photo: the game's frame format %d isn't supported", (int)f); bb->Release(); CaptureFailed(); return; }
     ID3D11Texture2D* src = bb; ID3D11Texture2D* resolved = nullptr;
     if (d.SampleDesc.Count > 1) {   // multisampled: resolve to one sample first
-        D3D11_TEXTURE2D_DESC r = d; r.SampleDesc.Count = 1; r.SampleDesc.Quality = 0; r.BindFlags = 0; r.MiscFlags = 0; r.Usage = D3D11_USAGE_DEFAULT;
-        if (SUCCEEDED(g_dev->CreateTexture2D(&r, nullptr, &resolved))) { g_ctx->ResolveSubresource(resolved, 0, bb, 0, f); src = resolved; }
+        D3D11_TEXTURE2D_DESC r = d; r.SampleDesc.Count = 1; r.SampleDesc.Quality = 0; r.BindFlags = 0;
+        r.MiscFlags = 0; r.CPUAccessFlags = 0; r.Usage = D3D11_USAGE_DEFAULT;
+        if (FAILED(g_dev->CreateTexture2D(&r, nullptr, &resolved))) {
+            Log("photo: couldn't resolve the game's multisampled frame");
+            bb->Release(); CaptureFailed(); return;
+        }
+        g_ctx->ResolveSubresource(resolved, 0, bb, 0, f);
+        src = resolved;
     }
     D3D11_TEXTURE2D_DESC sd = d; sd.SampleDesc.Count = 1; sd.SampleDesc.Quality = 0; sd.BindFlags = 0; sd.MiscFlags = 0;
     sd.Usage = D3D11_USAGE_STAGING; sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ; sd.MipLevels = 1; sd.ArraySize = 1;
     ID3D11Texture2D* stg = nullptr;
-    PhotoImg img;
-    if (SUCCEEDED(g_dev->CreateTexture2D(&sd, nullptr, &stg))) {
-        g_ctx->CopySubresourceRegion(stg, 0, 0, 0, 0, src, 0, nullptr);
-        D3D11_MAPPED_SUBRESOURCE m{};
-        if (SUCCEEDED(g_ctx->Map(stg, 0, D3D11_MAP_READ, 0, &m))) {
-            img.w = (int)d.Width; img.h = (int)d.Height; img.rgba.resize((size_t)img.w * img.h * 4);
-            for (int y = 0; y < img.h; y++) {
-                const uint8_t* row = (const uint8_t*)m.pData + (size_t)y * m.RowPitch;
-                uint8_t* o = img.rgba.data() + (size_t)y * img.w * 4;
-                for (int x = 0; x < img.w; x++, o += 4) {
-                    const uint8_t* p = row + x * 4;
-                    if (rgba) { o[0] = p[0]; o[1] = p[1]; o[2] = p[2]; }
-                    else if (bgra) { o[0] = p[2]; o[1] = p[1]; o[2] = p[0]; }
-                    else { uint32_t v = *(const uint32_t*)p; o[0] = (uint8_t)((v & 1023) >> 2); o[1] = (uint8_t)(((v >> 10) & 1023) >> 2); o[2] = (uint8_t)(((v >> 20) & 1023) >> 2); }
-                    o[3] = 255;
-                }
-            }
-            g_ctx->Unmap(stg, 0);
-        }
-        stg->Release();
-    }
+    HRESULT hr = g_dev->CreateTexture2D(&sd, nullptr, &stg);
+    if (SUCCEEDED(hr)) g_ctx->CopySubresourceRegion(stg, 0, 0, 0, 0, src, 0, nullptr);
     if (resolved) resolved->Release();
     bb->Release();
-    if (img.w <= 0) { Log("photo: couldn't copy the game's frame"); Photo_Failed(); return; }
+    if (FAILED(hr)) {
+        if (stg) stg->Release();
+        Log("photo: couldn't prepare the game's frame for readback"); CaptureFailed(); return;
+    }
+    g_pendingCapture.staging = stg;
+    g_pendingCapture.width = d.Width;
+    g_pendingCapture.height = d.Height;
+    g_pendingCapture.bgra = bgra;
+    g_pendingCapture.rgba = rgba;
+    g_pendingCapture.ten = ten;
+}
+
+static void FinishCapture() {
+    ID3D11Texture2D* stg = g_pendingCapture.staging;
+    if (!stg) return;
+    D3D11_MAPPED_SUBRESOURCE m{};
+    HRESULT hr = g_ctx->Map(stg, 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &m);
+    if (hr == DXGI_ERROR_WAS_STILL_DRAWING) return;
+    PendingCapture capture = g_pendingCapture;
+    if (FAILED(hr)) {
+        Log("photo: couldn't read back the game's frame");
+        g_pendingCapture = {};
+        stg->Release(); CaptureFailed(); return;
+    }
+    g_captureMapped = stg;
+
+    PhotoImg img;
+    img.w = (int)capture.width;
+    img.h = (int)capture.height;
+    try {
+        img.rgba.resize((size_t)img.w * img.h * 4);
+    } catch (const std::bad_alloc&) {
+        g_ctx->Unmap(stg, 0);
+        g_captureMapped = nullptr;
+        g_pendingCapture = {};
+        stg->Release();
+        Log("photo: not enough memory for the game's frame");
+        CaptureFailed();
+        return;
+    }
+    for (int y = 0; y < img.h; y++) {
+        const uint8_t* row = (const uint8_t*)m.pData + (size_t)y * m.RowPitch;
+        uint8_t* o = img.rgba.data() + (size_t)y * img.w * 4;
+        for (int x = 0; x < img.w; x++, o += 4) {
+            const uint8_t* p = row + x * 4;
+            if (capture.rgba) { o[0] = p[0]; o[1] = p[1]; o[2] = p[2]; }
+            else if (capture.bgra) { o[0] = p[2]; o[1] = p[1]; o[2] = p[0]; }
+            else { uint32_t v = *(const uint32_t*)p; o[0] = (uint8_t)((v & 1023) >> 2); o[1] = (uint8_t)(((v >> 10) & 1023) >> 2); o[2] = (uint8_t)(((v >> 20) & 1023) >> 2); }
+            o[3] = 255;
+        }
+    }
+    g_ctx->Unmap(stg, 0);
+    g_captureMapped = nullptr;
+    g_pendingCapture = {};
+    stg->Release();
+    g_captureActive = false;
     Log("photo: took the game's view (%dx%d)", img.w, img.h);
-    Photo_FromCapture(std::move(img));   // the worker makes the JPEG; the phone shows it when ready
+    Photo_FromCapture(std::move(img));
 }
 
 // ---- window input ---------------------------------------------------------------
@@ -143,13 +240,17 @@ static bool IsInputMsg(UINT m) {
 // replayed at the phone's pointer (see OverlayFrame). 1 = down, 0 = up.
 static int g_vrClicks[16], g_vrClickCount;
 
-HWND Overlay_GameWindow() { return g_hwnd; }
+HWND Overlay_GameWindow() {
+    if (!g_sc.load(std::memory_order_acquire)) return nullptr;
+    return g_hwnd;
+}
 
 static LRESULT CALLBACK HkWndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 #ifdef GITMO_TEST
     if (Input_IsGitmoKey(m, w, l)) Log("test: Gitmo's Esc reached the game window: %s (phone %s)", m == WM_KEYDOWN ? "key down" : m == WM_KEYUP ? "key up" : "char", g_menuOpen ? "open" : "closed");
 #endif
-    if (Input_IsGitmoKey(m, w, l)) return CallWindowProcW(g_origWndProc, h, m, w, l);   // Gitmo's Esc: straight to the game
+    WNDPROC orig = g_origWndProc.load(std::memory_order_acquire);
+    if (Input_IsGitmoKey(m, w, l)) return orig ? CallWindowProcW(orig, h, m, w, l) : DefWindowProcW(h, m, w, l);   // Gitmo's Esc: straight to the game
     if (g_menuOpen && g_imguiReady && IsInputMsg(m)) {
         {
             std::lock_guard<std::mutex> lk(g_uiLock);
@@ -173,29 +274,57 @@ static LRESULT CALLBACK HkWndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         if (m == WM_INPUT) return DefWindowProcW(h, m, w, l);  // raw input must still be cleaned up
         return 0;
     }
-    return CallWindowProcW(g_origWndProc, h, m, w, l);
+    return orig ? CallWindowProcW(orig, h, m, w, l) : DefWindowProcW(h, m, w, l);
 }
 
 // ---- drawing -------------------------------------------------------------------
+static void CleanupImGuiInit();
+
 static bool SetupImGui(IDXGISwapChain* sc) {
     if (FAILED(sc->GetDevice(__uuidof(ID3D11Device), (void**)&g_dev))) {
         Log("overlay: the game's swap chain is not DirectX 11 -> overlay off");
         return false;
     }
     g_dev->GetImmediateContext(&g_ctx);
+    if (!g_ctx) {
+        Log("overlay: couldn't get the game's Direct3D context -> overlay off");
+        g_dev->Release(); g_dev = nullptr;
+        return false;
+    }
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
     io.IniFilename = nullptr;   // never write imgui.ini (the VR mod uses that name)
     io.LogFilename = nullptr;
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard | ImGuiConfigFlags_NavEnableGamepad;
-    if (!ImGui_ImplWin32_Init(g_hwnd) || !ImGui_ImplDX11_Init(g_dev, g_ctx)) {
+    bool win32Ready = ImGui_ImplWin32_Init(g_hwnd);
+    bool dx11Ready = win32Ready && ImGui_ImplDX11_Init(g_dev, g_ctx);
+    if (!win32Ready || !dx11Ready) {
         Log("overlay: ImGui init failed -> overlay off");
+        CleanupImGuiInit();
         return false;
     }
     RECT rc; GetClientRect(g_hwnd, &rc);
     UI_Init((float)(rc.bottom - rc.top));
-    g_origWndProc = (WNDPROC)SetWindowLongPtrW(g_hwnd, GWLP_WNDPROC, (LONG_PTR)HkWndProc);
+    SetLastError(0);
+    LONG_PTR currentWndProc = GetWindowLongPtrW(g_hwnd, GWLP_WNDPROC);
+    DWORD getProcError = GetLastError();
+    if (!currentWndProc) {
+        Log("overlay: couldn't read the game window procedure (error %lu) -> overlay off", getProcError);
+        CleanupImGuiInit();
+        return false;
+    }
+    g_origWndProc.store((WNDPROC)currentWndProc, std::memory_order_release);
+    SetLastError(0);
+    LONG_PTR prevWndProc = SetWindowLongPtrW(g_hwnd, GWLP_WNDPROC, (LONG_PTR)HkWndProc);
+    DWORD subclassError = GetLastError();
+    if (!prevWndProc) {
+        Log("overlay: couldn't install the game window input hook (error %lu) -> overlay off", subclassError);
+        g_origWndProc.store(nullptr, std::memory_order_release);
+        CleanupImGuiInit();
+        return false;
+    }
+    g_origWndProc.store((WNDPROC)prevWndProc, std::memory_order_release);
     Log("overlay: ready on window %p (%ldx%ld), press %s in game", g_hwnd, rc.right - rc.left,
         rc.bottom - rc.top, g_cfg.menuKeyName.c_str());
     return true;
@@ -221,8 +350,20 @@ static bool MakeRtv(IDXGISwapChain* sc) {
     return SUCCEEDED(hr);
 }
 
+static void CleanupImGuiInit() {
+    ImGuiIO& io = ImGui::GetIO();
+    if (io.BackendRendererUserData) ImGui_ImplDX11_Shutdown();
+    if (io.BackendPlatformUserData) ImGui_ImplWin32_Shutdown();
+    ImGui::DestroyContext();
+    if (g_ctx) { g_ctx->Release(); g_ctx = nullptr; }
+    if (g_dev) { g_dev->Release(); g_dev = nullptr; }
+}
+
 #ifdef GITMO_TEST
-int g_testFrame = [] { const char* e = getenv("GITMO_TEST_PHASE"); return e ? atoi(e) * 300 : 0; }();   // start at a later test phase
+int g_testFrame = [] {
+    std::string phase;
+    return gitmo_shared::GetEnvironmentVariable("GITMO_TEST_PHASE", phase) ? atoi(phase.c_str()) * 300 : 0;
+}();   // start at a later test phase
 ImVec2 g_testGotIt, g_testBezel, g_testPhonePos;
 bool g_testSheet;
 ImVec2 g_testEmojiKey, g_testEmojiCell;   // phase 23: the smiley key, and the first emoji in the panel
@@ -234,6 +375,18 @@ static void TestCapture(IDXGISwapChain* sc, int n) {
     ID3D11Texture2D* bb = nullptr;
     if (FAILED(sc->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)&bb))) return;
     D3D11_TEXTURE2D_DESC d; bb->GetDesc(&d);
+    if (!d.Width || !d.Height || d.Width > D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION ||
+        d.Height > D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION || d.SampleDesc.Count > 1) {
+        Log("test: unsupported frame dimensions or multisampling");
+        bb->Release();
+        return;
+    }
+    uint64_t bytes = (uint64_t)d.Width * d.Height * 4;
+    if (bytes > 256ull * 1024 * 1024) {
+        Log("test: frame is too large to capture (%ux%u)", d.Width, d.Height);
+        bb->Release();
+        return;
+    }
     d.Usage = D3D11_USAGE_STAGING; d.BindFlags = 0; d.CPUAccessFlags = D3D11_CPU_ACCESS_READ; d.MiscFlags = 0;
     ID3D11Texture2D* st = nullptr;
     if (SUCCEEDED(g_dev->CreateTexture2D(&d, nullptr, &st))) {
@@ -241,18 +394,24 @@ static void TestCapture(IDXGISwapChain* sc, int n) {
         D3D11_MAPPED_SUBRESOURCE m;
         if (SUCCEEDED(g_ctx->Map(st, 0, D3D11_MAP_READ, 0, &m))) {
             wchar_t path[MAX_PATH]; swprintf_s(path, L"%s\\shot%d.bmp", ModuleDir().c_str(), n);
-            FILE* f = _wfopen(path, L"wb");
-            BITMAPFILEHEADER fh{}; BITMAPINFOHEADER ih{};
-            ih.biSize = sizeof(ih); ih.biWidth = d.Width; ih.biHeight = -(LONG)d.Height; ih.biPlanes = 1; ih.biBitCount = 32;
-            fh.bfType = 0x4D42; fh.bfOffBits = sizeof(fh) + sizeof(ih); fh.bfSize = fh.bfOffBits + d.Width * d.Height * 4;
-            fwrite(&fh, sizeof(fh), 1, f); fwrite(&ih, sizeof(ih), 1, f);
-            std::vector<uint8_t> row(d.Width * 4);
-            for (UINT y = 0; y < d.Height; y++) {
-                uint8_t* src = (uint8_t*)m.pData + y * m.RowPitch;
-                for (UINT x = 0; x < d.Width; x++) { row[x*4] = src[x*4+2]; row[x*4+1] = src[x*4+1]; row[x*4+2] = src[x*4]; row[x*4+3] = 255; }
-                fwrite(row.data(), row.size(), 1, f);
+            FILE* f = nullptr;
+            errno_t openErr = _wfopen_s(&f, path, L"wb");
+            if (f) {
+                BITMAPFILEHEADER fh{}; BITMAPINFOHEADER ih{};
+                ih.biSize = sizeof(ih); ih.biWidth = d.Width; ih.biHeight = -(LONG)d.Height; ih.biPlanes = 1; ih.biBitCount = 32;
+                fh.bfType = 0x4D42; fh.bfOffBits = sizeof(fh) + sizeof(ih); fh.bfSize = fh.bfOffBits + (DWORD)bytes;
+                bool ok = fwrite(&fh, sizeof(fh), 1, f) == 1 && fwrite(&ih, sizeof(ih), 1, f) == 1;
+                std::vector<uint8_t> row((size_t)d.Width * 4);
+                for (UINT y = 0; ok && y < d.Height; y++) {
+                    uint8_t* src = (uint8_t*)m.pData + (size_t)y * m.RowPitch;
+                    for (UINT x = 0; x < d.Width; x++) { row[x*4] = src[x*4+2]; row[x*4+1] = src[x*4+1]; row[x*4+2] = src[x*4]; row[x*4+3] = 255; }
+                    ok = fwrite(row.data(), row.size(), 1, f) == 1;
+                }
+                if (!ok) Log("test: couldn't write frame capture %d", n);
+                fclose(f);
+            } else {
+                Log("test: couldn't open frame capture %d (error %d)", n, (int)openErr);
             }
-            fclose(f);
             g_ctx->Unmap(st, 0);
         }
         st->Release();
@@ -305,24 +464,34 @@ static void OverlayFrame(IDXGISwapChain* sc) {
     }
     g_keyWasDown = down;
     Input_Frame(g_menuOpen);
+    if (g_captureActive && g_pendingCapture.staging) FinishCapture();
     static bool clipped;
     static bool wasOpen;
     if (!g_menuOpen) {
         g_uiTyping = false;
-        if (wasOpen) { wasOpen = false; std::lock_guard<std::mutex> lk(g_uiLock); UI_PhoneClosed(); }
+        if (wasOpen) {
+            wasOpen = false;
+            g_uiLock.lock();
+            __try { UI_PhoneClosed(); }
+            __finally { g_uiLock.unlock(); }
+        }
         if (clipped) { ClipCursor(nullptr); clipped = false; }
         return;
     }
 
     wasOpen = true;
-    std::lock_guard<std::mutex> lk(g_uiLock);
+    g_uiLock.lock();
+    __try {
     if (!g_imguiReady) {
         if (!SetupImGui(sc)) { g_broken = true; return; }
         g_imguiReady = true;
     }
     if (!g_rtv && !MakeRtv(sc)) return;
     // "Take photo": the frame as the game drew it - the phone hasn't been drawn onto it yet
-    if (g_captureReq.exchange(false)) CaptureFrame(sc);
+    if (g_captureReq.exchange(false)) {
+        g_captureActive = true;
+        CaptureFrame(sc);
+    }
 
     // In VR the phone is drawn into its own texture, which Gitmo hands to the headset as a
     // panel hanging in the room (vr.cpp). On a flat screen it is drawn onto the game's frame.
@@ -437,27 +606,41 @@ static void OverlayFrame(IDXGISwapChain* sc) {
 
     ID3D11RenderTargetView* oldRtv = nullptr; ID3D11DepthStencilView* oldDsv = nullptr;
     g_ctx->OMGetRenderTargets(1, &oldRtv, &oldDsv);
-    if (g_uiVrPanel) {
-        const float clear[4] = { 0, 0, 0, 0 };   // transparent around the rounded corners
-        g_ctx->ClearRenderTargetView(vrRtv, clear);
-        g_ctx->OMSetRenderTargets(1, &vrRtv, nullptr);
-    } else {
-        g_ctx->OMSetRenderTargets(1, &g_rtv, nullptr);
+    __try {
+        if (g_uiVrPanel) {
+            const float clear[4] = { 0, 0, 0, 0 };   // transparent around the rounded corners
+            g_ctx->ClearRenderTargetView(vrRtv, clear);
+            g_ctx->OMSetRenderTargets(1, &vrRtv, nullptr);
+        } else {
+            g_ctx->OMSetRenderTargets(1, &g_rtv, nullptr);
+        }
+        ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+    } __finally {
+        g_ctx->OMSetRenderTargets(1, &oldRtv, oldDsv);
+        if (oldRtv) oldRtv->Release();
+        if (oldDsv) oldDsv->Release();
     }
-    ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
-    g_ctx->OMSetRenderTargets(1, &oldRtv, oldDsv);
-    if (oldRtv) oldRtv->Release();
-    if (oldDsv) oldDsv->Release();
     if (g_uiVrPanel) VR_PhoneDrawn();
 #ifdef GITMO_TEST
     if (g_testFrame % 300 == 250) TestCapture(sc, g_testFrame / 300);
-    if (getenv("GITMO_TEST_ESC") && g_testFrame % 300 == 100) { Log("test: three money-left events in a row"); Input_PressEscape(); Input_PressEscape(); Input_PressEscape(); }
+    if (gitmo_shared::IsEnvironmentVariableSet("GITMO_TEST_ESC") && g_testFrame % 300 == 100) { Log("test: three money-left events in a row"); Input_PressEscape(); Input_PressEscape(); Input_PressEscape(); }
 #endif
+    } __finally {
+        g_uiLock.unlock();
+    }
 }
 
 static void GuardedFrame(IDXGISwapChain* sc) {
     __try { OverlayFrame(sc); }
     __except (EXCEPTION_EXECUTE_HANDLER) {
+        ClipCursor(nullptr);
+        bool captureActive = g_captureActive;
+        DiscardPendingCapture();
+        if (captureActive) CaptureFailed();
+        g_vrDragging = false;
+        g_uiVrPanel = false;
+        g_vrClickCount = 0;
+        g_uiTyping = false;
         g_broken = true;
         g_menuOpen = false;
         Log("overlay: error 0x%08X while drawing -> overlay switched off for this session", GetExceptionCode());
@@ -474,29 +657,33 @@ static HRESULT STDMETHODCALLTYPE Hk_Present1(IDXGISwapChain1* sc, UINT sync, UIN
     return o_Present1(sc, sync, flags, pp);
 }
 static HRESULT STDMETHODCALLTYPE Hk_ResizeBuffers(IDXGISwapChain* sc, UINT n, UINT w, UINT h, DXGI_FORMAT f, UINT fl) {
-    if (sc == g_sc) {
-        std::lock_guard<std::mutex> lk(g_uiLock);
-        if (g_rtv) { g_rtv->Release(); g_rtv = nullptr; }
-    }
+    if (sc != g_sc) return o_ResizeBuffers(sc, n, w, h, f, fl);
+    std::lock_guard<std::mutex> lk(g_uiLock);
+    if (g_rtv) { g_rtv->Release(); g_rtv = nullptr; }
     return o_ResizeBuffers(sc, n, w, h, f, fl);
 }
 
 HWND Overlay_Window() { return g_sc ? g_hwnd : nullptr; }
 
 static void AttachSwapChain(IDXGISwapChain* sc, HWND hwnd, UINT w, UINT h) {
+    std::lock_guard<std::mutex> lk(g_attachLock);
     Log("swap chain created: %p window %p %ux%u%s", sc, hwnd, w, h, g_sc ? " (already attached to another, ignored)" : "");
     if (g_sc) return;
     void** vt = *(void***)sc;
-    PatchSlot(vt, 8, (void*)Hk_Present, &o_Present);
-    PatchSlot(vt, 13, (void*)Hk_ResizeBuffers, &o_ResizeBuffers);
+    bool presentPatched = PatchSlot(vt, 8, (void*)Hk_Present, &o_Present);
+    bool resizePatched = PatchSlot(vt, 13, (void*)Hk_ResizeBuffers, &o_ResizeBuffers);
     IDXGISwapChain1* sc1 = nullptr;
     if (SUCCEEDED(sc->QueryInterface(__uuidof(IDXGISwapChain1), (void**)&sc1))) {
-        PatchSlot(*(void***)sc1, 22, (void*)Hk_Present1, &o_Present1);
+        if (!PatchSlot(*(void***)sc1, 22, (void*)Hk_Present1, &o_Present1))
+            Log("overlay: couldn't hook Present1; using Present where available");
         sc1->Release();
     }
-    if (!o_Present || !o_ResizeBuffers) { Log("overlay: could not hook Present -> overlay off"); return; }
+    if (!presentPatched || !resizePatched) {
+        Log("overlay: couldn't install required swap-chain hooks -> overlay off");
+        return;
+    }
     g_hwnd = hwnd;
-    g_sc = sc;
+    g_sc.store(sc, std::memory_order_release);
     Log("overlay: hooked the game's swap chain");
 }
 
@@ -532,19 +719,29 @@ static void HookFactory();
 // first factory it scans the game's code for the addresses it needs, and before the
 // DRM has unpacked that code it finds none (0 of 24) - its camera fixes then stay off,
 // which leaves the headset view zoomed in and turning the wrong way.
+static DWORD WINAPI OverlayStartThread(LPVOID) {
+    ULONGLONG start = GetTickCount64();
+    ULONGLONG nextLog = start + 120000;
+    for (;;) {
+        bool found = false;
+        EnumWindows(FindGameWindow, (LPARAM)&found);
+        if (found) break;
+        ULONGLONG now = GetTickCount64();
+        if (now >= nextLog) {
+            Log("overlay: still waiting for the game's unpacked window");
+            nextLog = now + 120000;
+        }
+        Sleep(50);
+    }
+    Log("overlay: game window is up after %.1f s", (GetTickCount64() - start) / 1000.0);
+    HookFactory();
+    return 0;
+}
+
 void Overlay_Start() {
-    if (HANDLE t = CreateThread(nullptr, 0, [](LPVOID) -> DWORD {
-            ULONGLONG start = GetTickCount64();
-            bool found = false;
-            while (!found && GetTickCount64() - start < 120000) {
-                EnumWindows(FindGameWindow, (LPARAM)&found);
-                if (!found) Sleep(50);
-            }
-            Log("overlay: %s after %.1f s", found ? "game window is up" : "no game window yet, going ahead",
-                (GetTickCount64() - start) / 1000.0);
-            HookFactory();
-            return 0;
-        }, nullptr, 0, nullptr)) CloseHandle(t);
+    HANDLE t = CreateThread(nullptr, 0, OverlayStartThread, nullptr, 0, nullptr);
+    if (t) CloseHandle(t);
+    else Log("overlay: couldn't start the DXGI hook watcher (error %lu)", GetLastError());
 }
 
 static void HookFactory() {

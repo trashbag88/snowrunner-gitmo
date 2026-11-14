@@ -4,21 +4,24 @@
 // channel as transfers. If they're offline it waits on the sender's PC and goes out as
 // soon as they're online again. Every message has an id; the receiver keeps each id once
 // and always answers ACK (so the sender can stop repeating it), and READ when the player
-// has seen the conversation.
+// has seen the conversation. READ is sent again whenever the other player comes back online.
 //
-//   C1|MSG|<idhex>|<order key>|<text>                    a message (key = sender's unix time x1000 + counter; text may contain '|')
+//   C1|MSG|<idhex>|<order key>|<text>                    a message (key = sender's unix time x1000, +1 where needed so it always rises; text may contain '|')
 //   C1|PCH|<idhex>|<order key>|<offset>|<total>|<bytes>   one piece (up to kChunk bytes) of a photo (a JPEG of <total> bytes)
 //   C1|ACK|<idhex>|0|                                    received (for a photo: every piece)
 //   C1|READ|<idhex>|0|                                   seen, up to and including this message
 //
 // A photo is sent as all its pieces at once, and again every kPhotoResend while it isn't
 // acknowledged; the receiver keeps pieces from earlier tries, so each try only has to fill
-// the gaps. Photos are kept as files by the IO callbacks (named by message id).
+// the gaps. Photos are kept as files by the IO callbacks (named by message id). A photo
+// whose file has gone missing can't be sent and is marked Failed.
 //
 // Pure logic (no Steam, no UI), so the test harness can run it over a lossy network.
 #pragma once
+#include <cstddef>
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 #include <map>
 #include <set>
@@ -26,13 +29,15 @@
 
 namespace sms {
 
-enum class St { Waiting, Delivered, Read, Received };   // Received = theirs
+// Received = theirs. Failed = ours, and can never be sent (its photo file is gone); it is not retried.
+// (Saved as numbers: new states go at the end.)
+enum class St { Waiting, Delivered, Read, Received, Failed };
 
 struct Msg {
     uint64_t id = 0;
     bool mine = false;
     long long wall = 0;          // unix seconds (sender's clock)
-    uint64_t key = 0;            // sender's order: unix ms-ish stamp, rising with every message it sends
+    uint64_t key = 0;            // sender's order: unix ms stamp, rising with every message it sends
     std::string text;            // (a photo: kPhotoText)
     bool photo = false;          // a picture: its JPEG is kept by IO::storePhoto / loadPhoto under this id
     St st = St::Waiting;
@@ -47,7 +52,7 @@ struct Contact {
     bool inGame = false;         // in our game session (not saved)
     int unread = 0;
     uint64_t readId = 0;         // their latest message we've told them we read
-    bool readPending = false;    // READ still to send
+    bool readPending = false;    // READ still to send (set again when they come back online; not saved)
     std::vector<Msg> msgs;       // oldest first
 };
 
@@ -55,17 +60,17 @@ struct IO {
     std::function<void(uint64_t peer, const std::string& msg)> send;
     std::function<uint64_t()> now;                 // milliseconds, monotonic
     std::function<long long()> wallclock;          // unix seconds
-    std::function<uint64_t()> newId;
+    std::function<uint64_t()> newId;               // must be set, and never return the same id twice
     std::function<void(const std::string&)> persist;
     std::function<void(const std::string&)> log;
-    std::function<void(uint64_t peer, const std::string& name, const std::string& text)> ring;   // a new message came in
+    std::function<void(uint64_t peer, const std::string& name, const std::string& text)> ring;   // a new message came in (may call back into the Engine, e.g. Forget)
     std::function<bool(uint64_t id, const std::string& jpeg)> storePhoto;   // keep a photo (false: couldn't)
     std::function<std::string(uint64_t id)> loadPhoto;                     // "" if it's gone
     std::function<void(uint64_t id)> deletePhoto;
 };
 
 constexpr size_t kMaxText = 300;               // bytes of UTF-8 per message
-constexpr size_t kKeepPerContact = 500;        // history kept per contact
+constexpr size_t kKeepPerContact = 500;        // history kept per contact (messages still Waiting are never dropped)
 constexpr uint64_t kResend = 5000;             // repeat an unacknowledged message while they're online
 constexpr size_t kChunk = 48 * 1024;           // bytes of photo per network message
 constexpr size_t kMaxPhoto = 1536 * 1024;      // largest photo accepted
@@ -76,7 +81,7 @@ extern const char* const kPhotoText;           // a photo message's text in the 
 class Engine {
 public:
     explicit Engine(IO io) : io_(std::move(io)) {}
-    void Load(const std::string& text);
+    void Load(const std::string& text);   // at start-up: replaces everything (online state included)
     std::string Save() const;
 
     // presence, from the transfer engine's view of who has Gitmo and is online
@@ -84,7 +89,7 @@ public:
 
     // the player
     bool Send(uint64_t peer, const std::string& text);        // false: empty
-    bool SendPhoto(uint64_t peer, const std::string& jpeg);   // false: empty, too big or couldn't be kept
+    bool SendPhoto(uint64_t peer, const std::string& jpeg);   // false: empty, too big, not a JPEG or couldn't be kept
     void SetViewing(uint64_t peer) { viewing_ = peer; if (peer) MarkRead(peer); }   // 0 = no chat open
     void MarkRead(uint64_t peer);
     void Forget(uint64_t peer);                           // delete a conversation and the contact
@@ -94,29 +99,33 @@ public:
     void OnMessage(uint64_t from, const std::string& msg);
     void Tick();
 
-    const std::map<uint64_t, Contact>& Contacts() const { return contacts_; }
+    const std::map<uint64_t, Contact>& Contacts() const { return contacts_; }   // (don't hold it across a call that can Forget)
     int Unread() const;
     int Receiving(uint64_t peer) const;   // photos from them coming in now (pieces still missing)
 
-    static std::string CleanText(const std::string& s);   // one line, valid UTF-8, at most kMaxText bytes
+    static std::string CleanText(const std::string& s);   // one line, strictly valid UTF-8, no control or bidi characters, at most kMaxText bytes
 
 private:
     struct Partial { uint64_t from = 0, key = 0, last = 0; std::string data; std::vector<bool> got; size_t have = 0; };
     Contact& Get(uint64_t peer);
-    void Transmit(Contact& c, Msg& m);
+    void Transmit(Contact& c, Msg& m);      // doesn't call Changed(): the caller does
     void SendRead(Contact& c);
     void AddTheirs(Contact& c, uint64_t from, const Msg& m, const std::string& ringText);
+    Msg& QueueMine(Contact& c, Msg&& m);    // key, state, history; the reference is good until the next change to c.msgs
     void Trim(Contact& c);                  // keep kKeepPerContact, deleting the photos of the oldest
     void DropPhoto(const Msg& m) { if (m.photo && io_.deletePhoto) io_.deletePhoto(m.id); }
     void Changed() { if (io_.persist) io_.persist(Save()); }
-    void Logf(const char* fmt, ...) const;
+    void Logf(const char* fmt, ...) const
+#if defined(__GNUC__) || defined(__clang__)
+        __attribute__((format(printf, 2, 3)))
+#endif
+        ;
 
     IO io_;
     std::map<uint64_t, Contact> contacts_;
     std::map<uint64_t, Partial> partial_;   // photos being received, by message id
     uint64_t viewing_ = 0;
-    uint64_t counter_ = 0;
-    std::set<uint64_t> erased_;  // ids of erased messages from them, so a late repeat doesn't bring one back (this run only)
+    std::set<uint64_t> erased_;  // ids of theirs that were erased or trimmed, so a late repeat doesn't bring one back (saved; capped)
 };
 
 const char* StText(St s);

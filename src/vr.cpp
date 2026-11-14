@@ -17,8 +17,11 @@
 // always go to the runtime unchanged.
 
 #include "gitmo.h"
+#include "shared.h"
 #include <d3d11.h>
+#include <algorithm>
 #include <cmath>
+#include <cctype>
 #include <vector>
 #include <string>
 #define XR_USE_PLATFORM_WIN32
@@ -52,7 +55,9 @@ static ID3D11Device* g_xrDev;                 // the device the VR mod gave Open
 static XrSpace g_local = XR_NULL_HANDLE, g_view = XR_NULL_HANDLE;
 static XrSwapchain g_swap = XR_NULL_HANDLE;
 static std::vector<ID3D11Texture2D*> g_images;
-static bool g_setupFailed;
+static uint32_t g_acquiredIndex;
+static bool g_imageAcquired, g_imageWaited;
+static std::atomic<bool> g_setupFailed{ false };
 static std::atomic<int> g_state{0};           // 0 no VR seen, 1 hooked, 2 session running, 3 panel ready
 static std::atomic<bool> g_frameSeen;
 
@@ -69,6 +74,7 @@ const int kVrTexW = 588, kVrTexH = 1200;      // 0.49 : 1, same shape as the pho
 static bool g_pinValid;
 static float g_pinYaw, g_pinPitch = -0.21f;   // radians; ~12 degrees below eye level
 static XrVector3f g_pinPos{0, 0, 0};
+static std::mutex g_pinMx;
 static std::atomic<bool> g_wantPin{true};
 
 // ---- small maths ----------------------------------------------------------------------
@@ -90,7 +96,27 @@ static XrQuaternionf AxisAngle(float x, float y, float z, float a) {
 
 // ---- the layer ------------------------------------------------------------------------
 static void ReleaseSwapchain() {
-    if (g_swap) { r_DestroySwapchain(g_swap); g_swap = XR_NULL_HANDLE; }
+    if (g_swap && g_imageAcquired) {
+        if (!g_imageWaited) {
+            XrSwapchainImageWaitInfo wi{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+            wi.timeout = XR_INFINITE_DURATION;
+            XrResult waited = r_Wait(g_swap, &wi);
+            g_imageWaited = waited != XR_TIMEOUT_EXPIRED && XR_SUCCEEDED(waited);
+        }
+        if (g_imageWaited) {
+            XrSwapchainImageReleaseInfo ri{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+            if (XR_FAILED(r_Release(g_swap, &ri))) Log("vr: could not release a panel image during cleanup");
+        } else {
+            Log("vr: could not wait for a panel image during cleanup");
+        }
+    }
+    g_imageAcquired = g_imageWaited = false;
+    g_acquiredIndex = 0;
+    if (g_swap) {
+        XrResult r = r_DestroySwapchain(g_swap);
+        if (XR_FAILED(r)) Log("vr: could not destroy the phone panel swapchain (%d)", (int)r);
+        g_swap = XR_NULL_HANDLE;
+    }
     g_images.clear();
 }
 
@@ -108,13 +134,17 @@ static bool SetupPanel() {
 
     // A format the phone texture can be copied into directly: the R8G8B8A8 family.
     uint32_t n = 0;
-    r_EnumFormats(g_sess, 0, &n, nullptr);
+    if (XR_FAILED(r = r_EnumFormats(g_sess, 0, &n, nullptr))) return fail("could not enumerate panel formats", r);
     std::vector<int64_t> fmts(n);
-    if (n) r_EnumFormats(g_sess, n, &n, fmts.data());
+    if (n && XR_FAILED(r = r_EnumFormats(g_sess, n, &n, fmts.data()))) return fail("could not read panel formats", r);
     int64_t fmt = 0;
     for (int64_t want : { (int64_t)DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, (int64_t)DXGI_FORMAT_R8G8B8A8_UNORM })
         for (int64_t f : fmts) if (f == want && !fmt) fmt = f;
-    if (!fmt) return fail("the headset offers no RGBA8 panel format", XR_SUCCESS);
+    if (!fmt) {
+        Log("vr: the headset offers no RGBA8 panel format -> phone stays on the flat screen");
+        g_setupFailed = true;
+        return false;
+    }
 
     XrSwapchainCreateInfo sc{XR_TYPE_SWAPCHAIN_CREATE_INFO};
     sc.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
@@ -122,9 +152,18 @@ static bool SetupPanel() {
     sc.faceCount = 1; sc.arraySize = 1; sc.mipCount = 1;
     if (XR_FAILED(r = r_CreateSwapchain(g_sess, &sc, &g_swap))) return fail("could not create the phone panel", r);
     uint32_t ni = 0;
-    r_EnumImages(g_swap, 0, &ni, nullptr);
+    if (XR_FAILED(r = r_EnumImages(g_swap, 0, &ni, nullptr))) {
+        ReleaseSwapchain();
+        return fail("could not enumerate panel images", r);
+    }
+    if (!ni) {
+        ReleaseSwapchain();
+        Log("vr: the panel swapchain has no images -> phone stays on the flat screen");
+        g_setupFailed = true;
+        return false;
+    }
     std::vector<XrSwapchainImageD3D11KHR> imgs(ni, { XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR });
-    if (!ni || XR_FAILED(r = r_EnumImages(g_swap, ni, &ni, (XrSwapchainImageBaseHeader*)imgs.data()))) {
+    if (XR_FAILED(r = r_EnumImages(g_swap, ni, &ni, (XrSwapchainImageBaseHeader*)imgs.data()))) {
         ReleaseSwapchain();
         return fail("no panel images", r);
     }
@@ -142,56 +181,108 @@ static void Pin(XrTime t) {
         !(loc.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT) ||
         !(loc.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT)) return;
     XrVector3f fwd = QRot(loc.pose.orientation, { 0, 0, -1 });
-    g_pinYaw = atan2f(-fwd.x, -fwd.z);
-    g_pinPitch = -0.21f;   // ~12 degrees down
-    g_pinPos = loc.pose.position;
-    g_pinValid = true;
+    {
+        std::lock_guard<std::mutex> lock(g_pinMx);
+        g_pinYaw = atan2f(-fwd.x, -fwd.z);
+        g_pinPitch = -0.21f;   // ~12 degrees down
+        g_pinPos = loc.pose.position;
+        g_pinValid = true;
+    }
     Log("vr: phone placed %.2f m in front of you", g_cfg.vrDistance);
 }
 
 // Dragging by the border: swing the phone around the head, keeping its distance.
 void VR_DragBy(float dYaw, float dPitch) {
+    std::lock_guard<std::mutex> lock(g_pinMx);
     g_pinYaw += dYaw;
     g_pinPitch = std::min(std::max(g_pinPitch + dPitch, -1.3f), 1.3f);
 }
 
 static bool BuildQuad(XrCompositionLayerQuad& q, XrTime t) {
-    if (g_wantPin.exchange(false) || !g_pinValid) Pin(t);
-    if (!g_pinValid) return false;
+    bool pin = g_wantPin.exchange(false);
+    {
+        std::lock_guard<std::mutex> lock(g_pinMx);
+        pin = pin || !g_pinValid;
+    }
+    if (pin) Pin(t);
+    float yaw, pitch;
+    XrVector3f pinPos;
+    {
+        std::lock_guard<std::mutex> lock(g_pinMx);
+        if (!g_pinValid) return false;
+        yaw = g_pinYaw; pitch = g_pinPitch; pinPos = g_pinPos;
+    }
     // A real-sized object: further away looks smaller. S / M / L are its height in metres
     // (larger than a real phone, so it stays readable in the headset).
     static const float kHeight[3] = { 0.30f, 0.40f, 0.52f };
     float d = std::min(std::max(g_cfg.vrDistance, 0.25f), 3.0f);
     float h = kHeight[std::min(std::max(g_cfg.phoneSize, 0), 2)];
-    XrQuaternionf g_pinRot = QMul(AxisAngle(0, 1, 0, g_pinYaw), AxisAngle(1, 0, 0, g_pinPitch));
-    XrVector3f off = QRot(g_pinRot, { 0, 0, -d });
+    XrQuaternionf pinRot = QMul(AxisAngle(0, 1, 0, yaw), AxisAngle(1, 0, 0, pitch));
+    XrVector3f off = QRot(pinRot, { 0, 0, -d });
     q = { XR_TYPE_COMPOSITION_LAYER_QUAD };
     q.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;   // ImGui output is premultiplied
     q.space = g_local;
     q.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
     q.subImage.swapchain = g_swap;
     q.subImage.imageRect = { { 0, 0 }, { kVrTexW, kVrTexH } };
-    q.pose.orientation = g_pinRot;
-    q.pose.position = { g_pinPos.x + off.x, g_pinPos.y + off.y, g_pinPos.z + off.z };
+    q.pose.orientation = pinRot;
+    q.pose.position = { pinPos.x + off.x, pinPos.y + off.y, pinPos.z + off.z };
     q.size = { h * kVrTexW / kVrTexH, h };
     return true;
 }
 
 static bool CopyIntoPanel() {
+    if (!g_xrDev || !g_tex) return false;
     ID3D11DeviceContext* ctx = nullptr;
     g_xrDev->GetImmediateContext(&ctx);
-    XrSwapchainImageAcquireInfo ai{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
-    uint32_t idx = 0;
-    bool ok = false;
-    if (XR_SUCCEEDED(r_Acquire(g_swap, &ai, &idx))) {
-        XrSwapchainImageWaitInfo wi{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
-        wi.timeout = 100000000;   // 100 ms
-        if (XR_SUCCEEDED(r_Wait(g_swap, &wi)) && idx < g_images.size()) {
-            ctx->CopyResource(g_images[idx], g_tex);
-            ok = true;
+    if (!ctx) {
+        g_setupFailed = true;
+        Log("vr: could not get the headset graphics context -> phone stays on the flat screen");
+        return false;
+    }
+    if (!g_imageAcquired) {
+        XrSwapchainImageAcquireInfo ai{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+        XrResult acquired = r_Acquire(g_swap, &ai, &g_acquiredIndex);
+        if (XR_FAILED(acquired)) {
+            g_setupFailed = true;
+            Log("vr: could not acquire a panel image (%d) -> phone stays on the flat screen", (int)acquired);
+            ctx->Release();
+            return false;
         }
-        XrSwapchainImageReleaseInfo ri{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
-        r_Release(g_swap, &ri);
+        g_imageAcquired = true;
+        g_imageWaited = false;
+    }
+
+    XrSwapchainImageWaitInfo wi{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+    wi.timeout = 5000000;   // 5 ms: skip the panel rather than stall a headset frame
+    XrResult waited = r_Wait(g_swap, &wi);
+    if (waited == XR_TIMEOUT_EXPIRED) {
+        ctx->Release();
+        return false;
+    }
+    if (XR_FAILED(waited)) {
+        g_setupFailed = true;
+        Log("vr: could not wait for a panel image (%d) -> phone stays on the flat screen", (int)waited);
+        ctx->Release();
+        return false;
+    }
+    g_imageWaited = true;
+
+    bool ok = false;
+    if (g_acquiredIndex < g_images.size()) {
+        ctx->CopyResource(g_images[g_acquiredIndex], g_tex);
+        ok = true;
+    } else {
+        g_setupFailed = true;
+        Log("vr: the runtime returned an invalid panel image index -> phone stays on the flat screen");
+    }
+    XrSwapchainImageReleaseInfo ri{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+    XrResult released = r_Release(g_swap, &ri);
+    if (XR_SUCCEEDED(released)) g_imageAcquired = g_imageWaited = false;
+    else {
+        g_setupFailed = true;
+        Log("vr: could not release a panel image (%d) -> phone stays on the flat screen", (int)released);
+        ok = false;
     }
     ctx->Release();
     return ok;
@@ -233,7 +324,10 @@ static XrResult XRAPI_CALL W_CreateSession(XrInstance inst, const XrSessionCreat
         if (h->type == XR_TYPE_GRAPHICS_BINDING_D3D11_KHR) dev = ((const XrGraphicsBindingD3D11KHR*)h)->device;
     if (g_sess) return r;   // a second session: leave it alone
     g_inst = inst; g_sess = *out; g_xrDev = dev; g_setupFailed = !dev;
-    auto get = [&](const char* n, auto& fn) { r_GIPA(inst, n, (PFN_xrVoidFunction*)&fn); return fn != nullptr; };
+    auto get = [&](const char* n, auto& fn) {
+        fn = nullptr;
+        return XR_SUCCEEDED(r_GIPA(inst, n, (PFN_xrVoidFunction*)&fn)) && fn != nullptr;
+    };
     bool ok = get("xrCreateReferenceSpace", r_CreateReferenceSpace) & get("xrLocateSpace", r_LocateSpace) &
               get("xrDestroySpace", r_DestroySpace) & get("xrEnumerateSwapchainFormats", r_EnumFormats) &
               get("xrCreateSwapchain", r_CreateSwapchain) & get("xrDestroySwapchain", r_DestroySwapchain) &
@@ -250,7 +344,8 @@ static XrResult XRAPI_CALL W_DestroySession(XrSession s) {
         ReleaseSwapchain();
         if (g_local) { r_DestroySpace(g_local); g_local = XR_NULL_HANDLE; }
         if (g_view) { r_DestroySpace(g_view); g_view = XR_NULL_HANDLE; }
-        g_sess = XR_NULL_HANDLE; g_xrDev = nullptr; g_pinValid = false;
+        g_sess = XR_NULL_HANDLE; g_xrDev = nullptr;
+        { std::lock_guard<std::mutex> lock(g_pinMx); g_pinValid = false; }
         g_state = 1;
         Log("vr: headset session ended");
     }
@@ -280,31 +375,84 @@ static XrResult XRAPI_CALL W_Negotiate(const XrNegotiateLoaderInfo* li, XrNegoti
 
 // ---- start-up: find the runtime and take its negotiate export --------------------------
 static std::wstring ActiveRuntimeJson() {
-    wchar_t env[MAX_PATH * 2];
-    if (GetEnvironmentVariableW(L"XR_RUNTIME_JSON", env, MAX_PATH * 2)) return env;
-    wchar_t v[MAX_PATH * 2]; DWORD n = sizeof(v);
-    if (RegGetValueW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Khronos\\OpenXR\\1", L"ActiveRuntime", RRF_RT_REG_SZ, nullptr, v, &n) == ERROR_SUCCESS) return v;
+    DWORD envSize = GetEnvironmentVariableW(L"XR_RUNTIME_JSON", nullptr, 0);
+    if (envSize) {
+        std::vector<wchar_t> env(envSize);
+        DWORD written = GetEnvironmentVariableW(L"XR_RUNTIME_JSON", env.data(), envSize);
+        if (written && written < envSize) return std::wstring(env.data(), written);
+    }
+
+    DWORD bytes = 0;
+    if (RegGetValueW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Khronos\\OpenXR\\1", L"ActiveRuntime",
+                     RRF_RT_REG_SZ, nullptr, nullptr, &bytes) == ERROR_SUCCESS &&
+        bytes >= sizeof(wchar_t)) {
+        std::vector<wchar_t> value((bytes + sizeof(wchar_t) - 1) / sizeof(wchar_t));
+        if (RegGetValueW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Khronos\\OpenXR\\1", L"ActiveRuntime",
+                         RRF_RT_REG_SZ, nullptr, value.data(), &bytes) == ERROR_SUCCESS) {
+            auto end = std::find(value.begin(), value.end(), L'\0');
+            if (end != value.end()) return std::wstring(value.begin(), end);
+        }
+    }
     return L"";
 }
 
-static std::wstring RuntimeLibrary(const std::wstring& json) {
-    FILE* f = _wfopen(json.c_str(), L"rb");
-    if (!f) return L"";
-    std::string s; char buf[4096]; size_t k;
-    while ((k = fread(buf, 1, sizeof(buf), f)) > 0) s.append(buf, k);
-    fclose(f);
-    size_t p = s.find("\"library_path\"");
-    if (p == std::string::npos || (p = s.find(':', p)) == std::string::npos || (p = s.find('"', p)) == std::string::npos) return L"";
-    std::string lib;
-    for (size_t i = p + 1; i < s.size() && s[i] != '"'; i++) {
-        if (s[i] == '\\' && i + 1 < s.size()) i++;
-        lib += s[i];
+static void SkipJsonSpace(const std::string& json, size_t& pos) {
+    while (pos < json.size() && isspace((unsigned char)json[pos])) pos++;
+}
+
+static bool ReadJsonString(const std::string& json, size_t& pos, std::string& out) {
+    return gitmo_shared::ReadJsonString(json, pos, out);
+}
+
+static bool JsonStringMember(const std::string& json, const char* key, std::string& value) {
+    for (size_t pos = 0; pos < json.size();) {
+        if (json[pos] != '"') { pos++; continue; }
+        std::string token;
+        if (!ReadJsonString(json, pos, token)) return false;
+        size_t next = pos;
+        SkipJsonSpace(json, next);
+        if (token == key && next < json.size() && json[next] == ':') {
+            next++;
+            SkipJsonSpace(json, next);
+            return ReadJsonString(json, next, value);
+        }
     }
-    std::wstring w(lib.begin(), lib.end());
+    return false;
+}
+
+static std::wstring RuntimeLibrary(const std::wstring& json) {
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, json.c_str(), L"rb") != 0 || !f) return L"";
+    if (_fseeki64(f, 0, SEEK_END) != 0) { fclose(f); return L""; }
+    __int64 size = _ftelli64(f);
+    if (size <= 0 || size > 1024 * 1024 || _fseeki64(f, 0, SEEK_SET) != 0) {
+        fclose(f);
+        return L"";
+    }
+    std::string s((size_t)size, '\0');
+    bool read = fread(&s[0], 1, s.size(), f) == s.size();
+    fclose(f);
+    std::string lib;
+    if (!read || !JsonStringMember(s, "library_path", lib) || lib.empty() || lib.find('\0') != std::string::npos) return L"";
+    int wideSize = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, lib.data(), (int)lib.size(), nullptr, 0);
+    if (wideSize <= 0) return L"";
+    std::wstring w(wideSize, L'\0');
+    if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, lib.data(), (int)lib.size(), &w[0], wideSize) != wideSize) return L"";
     bool absolute = w.size() > 2 && (w[1] == L':' || (w[0] == L'\\' && w[1] == L'\\'));
-    if (!absolute) w = json.substr(0, json.find_last_of(L"\\/") + 1) + w;
-    wchar_t full[MAX_PATH * 2];
-    return GetFullPathNameW(w.c_str(), MAX_PATH * 2, full, nullptr) ? full : w;
+    if (!absolute) {
+        size_t slash = json.find_last_of(L"\\/");
+        if (slash != std::wstring::npos) w = json.substr(0, slash + 1) + w;
+    }
+    DWORD capacity = MAX_PATH * 2;
+    std::vector<wchar_t> full(capacity);
+    for (;;) {
+        DWORD written = GetFullPathNameW(w.c_str(), capacity, full.data(), nullptr);
+        if (!written) return w;
+        if (written < capacity) return std::wstring(full.data(), written);
+        if (written >= MAXDWORD) return w;
+        capacity = written + 1;
+        full.resize(capacity);
+    }
 }
 
 // Point one export of a loaded DLL at our function. Export entries are 32-bit offsets
@@ -329,12 +477,26 @@ static bool PatchExport(HMODULE mod, const char* name, void* target, void** orig
         stub[0] = 0xFF; stub[1] = 0x25; *(DWORD*)(stub + 2) = 0;   // jmp [rip+0]
         *(void**)(stub + 6) = target;
         DWORD old;
-        VirtualProtect(stub, 0x1000, PAGE_EXECUTE_READ, &old);
-        FlushInstructionCache(GetCurrentProcess(), stub, 16);
-        *orig = base + *slot;
-        if (!VirtualProtect(slot, sizeof(DWORD), PAGE_READWRITE, &old)) return false;
+        if (!VirtualProtect(stub, 0x1000, PAGE_EXECUTE_READ, &old) ||
+            !FlushInstructionCache(GetCurrentProcess(), stub, 16)) {
+            VirtualFree(stub, 0, MEM_RELEASE);
+            return false;
+        }
+        DWORD originalRva = *slot;
+        if (!VirtualProtect(slot, sizeof(DWORD), PAGE_READWRITE, &old)) {
+            VirtualFree(stub, 0, MEM_RELEASE);
+            return false;
+        }
+        DWORD originalProtect = old;
         InterlockedExchange((LONG*)slot, (LONG)(stub - base));
-        VirtualProtect(slot, sizeof(DWORD), old, &old);
+        DWORD ignored;
+        if (!VirtualProtect(slot, sizeof(DWORD), originalProtect, &ignored)) {
+            InterlockedExchange((LONG*)slot, (LONG)originalRva);
+            VirtualProtect(slot, sizeof(DWORD), originalProtect, &ignored);
+            VirtualFree(stub, 0, MEM_RELEASE);
+            return false;
+        }
+        *orig = base + originalRva;
         return true;
     }
     return false;
@@ -401,6 +563,16 @@ const char* VR_Status() {
 
 ID3D11RenderTargetView* VR_PhoneTarget(ID3D11Device* dev, int& w, int& h) {
     w = kVrTexW; h = kVrTexH;
+    if (!dev) {
+        g_setupFailed = true;
+        Log("vr: no game graphics device for the phone texture -> flat screen only");
+        return nullptr;
+    }
+    if (g_tex && g_texDev != dev) {
+        g_setupFailed = true;
+        Log("vr: the game graphics device changed -> phone stays on the flat screen");
+        return nullptr;
+    }
     if (!g_tex) {
         D3D11_TEXTURE2D_DESC d{};
         d.Width = kVrTexW; d.Height = kVrTexH; d.MipLevels = 1; d.ArraySize = 1;

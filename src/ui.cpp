@@ -2,6 +2,7 @@
 // like a phone payments app rather than a debug window.
 
 #include "gitmo.h"
+#include "shared.h"
 #include "imgui.h"
 #include "imgui_internal.h"   // ClearActiveID: a drag that scrolls cancels the tap
 #include <cstdio>
@@ -40,11 +41,14 @@ static void ApplyTheme() {
 }
 
 // ---- Steam name -------------------------------------------------------------------
-static const char* GuardedPersona(void* (__cdecl* acc)(), const char* (__cdecl* getName)(void*)) {
+static void GuardedPersona(void* (__cdecl* acc)(), const char* (__cdecl* getName)(void*), char* out, size_t cap) {
+    if (!out || !cap) return;
+    out[0] = 0;
     __try {
         void* f = acc();
-        return f ? getName(f) : nullptr;
-    } __except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
+        const char* name = f ? getName(f) : nullptr;
+        if (name) strncpy_s(out, cap, name, _TRUNCATE);
+    } __except (EXCEPTION_EXECUTE_HANDLER) { out[0] = 0; }
 }
 
 std::string Steam_PersonaName() {
@@ -56,8 +60,9 @@ std::string Steam_PersonaName() {
         char fn[64]; sprintf_s(fn, "SteamAPI_SteamFriends_v%03d", v);
         auto acc = (void*(__cdecl*)())GetProcAddress(sa, fn);
         if (!acc) continue;
-        const char* n = GuardedPersona(acc, getName);
-        return n && *n ? std::string(n) : std::string();
+        char name[256] = {};
+        GuardedPersona(acc, getName, name, sizeof(name));
+        if (name[0]) return name;
     }
     return {};
 }
@@ -75,7 +80,8 @@ static void TextCenter(ImFont* f, float size, ImVec2 centerTop, ImU32 c, const c
 }
 
 static std::string Money(long long v, bool sign = false) {
-    char digits[32]; sprintf_s(digits, "%lld", v < 0 ? -v : v);
+    unsigned long long magnitude = v < 0 ? 0ULL - (unsigned long long)v : (unsigned long long)v;
+    char digits[32]; sprintf_s(digits, "%llu", magnitude);
     std::string out;
     int n = (int)strlen(digits);
     for (int i = 0; i < n; i++) { out += digits[i]; if ((n - i - 1) % 3 == 0 && i != n - 1) out += ','; }
@@ -865,6 +871,7 @@ static SmsView g_smsView;
 static uint64_t g_chat;                    // open conversation (0 = contact list)
 static uint64_t g_viewSent;                // conversation the SMS engine has been told is open
 static char g_draft[sms::kMaxText + 1];
+static std::string g_smsSendErr;
 static size_t g_chatShown = (size_t)-1;    // messages drawn last frame: scroll to the end when it changes
 static bool g_focusDraft;
 static const ImU32 kBlue = IM_COL32(10, 132, 255, 255), kGreen = IM_COL32(52, 199, 89, 255);
@@ -953,7 +960,7 @@ static const sms::Contact* FindContact(uint64_t id) {
     return nullptr;
 }
 static void OpenChat(uint64_t id) {
-    g_chat = id; g_chatShown = (size_t)-1; g_draft[0] = 0; g_focusDraft = true;
+    g_chat = id; g_chatShown = (size_t)-1; g_draft[0] = 0; g_focusDraft = true; g_smsSendErr.clear();
 }
 
 static void ScreenSmsList(ImVec2 a, ImVec2 b) {
@@ -1243,7 +1250,8 @@ static void EmojiPanel(ImVec2 a, ImVec2 b) {   // a..b = the panel's area
 enum { PhNone, PhPanel, PhWorking, PhPreview, PhViewer };
 static int g_photoUi = PhNone;
 static ULONGLONG g_photoErrUntil, g_workSince;
-struct PicTex { void* srv = nullptr; int w = 0, h = 0; ULONGLONG used = 0; bool failed = false, asked = false; };
+static ULONGLONG g_photoSendErrUntil;
+struct PicTex { void* srv = nullptr; int w = 0, h = 0; ULONGLONG used = 0, retryAt = 0; bool failed = false, asked = false; };
 static std::map<std::string, PicTex> g_pics;   // "m<id>": a photo message; "t<path>": a screenshot thumbnail
 static std::vector<std::wstring> g_shots;
 static std::string g_prevJpeg;
@@ -1279,13 +1287,18 @@ static void PicsPump() {
 static PicTex* Pic(const std::string& key, const std::wstring& path, int maxSide) {
     PicTex& t = g_pics[key];
     t.used = GetTickCount64();
-    if (!t.srv && !t.failed && !t.asked) { t.asked = true; Photo_DecodeAsync(key, path, maxSide); }
+    ULONGLONG now = t.used;
+    if (!t.srv && !t.failed && (!t.asked || now >= t.retryAt)) {
+        t.asked = Photo_DecodeAsync(key, path, maxSide);
+        t.retryAt = now + (t.asked ? 3000 : 1000);
+    }
     return &t;
 }
 static void ClosePreview() {
     if (g_prevTex.srv) Overlay_FreeTexture(g_prevTex.srv);
     g_prevTex = PicTex{};
     g_prevJpeg.clear();
+    g_photoSendErrUntil = 0;
 }
 static void ClosePhotos() {   // leaving the chat, closing the phone
     if (g_photoUi == PhWorking) Photo_Cancel();
@@ -1401,7 +1414,9 @@ static void PhotoScreen(ImVec2 a, ImVec2 b, const sms::Contact* c) {
         TextCenter(F_Semi, 14 * s, ImVec2(cx, a.y + 10 * s), white, title.c_str());
         DrawPic(g_prevTex, ImVec2(a.x + 8 * s, a.y + 36 * s), ImVec2(b.x - 8 * s, b.y - 96 * s), 10 * s, false);
         char kb[32]; sprintf_s(kb, "%zu KB", g_prevJpeg.size() / 1024);
-        TextCenter(F_Reg, 11 * s, ImVec2(cx, b.y - 90 * s), grey, kb);
+        bool sendFailed = GetTickCount64() < g_photoSendErrUntil;
+        TextCenter(F_Reg, 11 * s, ImVec2(cx, b.y - 90 * s), sendFailed ? kRedText() : grey,
+                   sendFailed ? "Couldn't send - try again" : kb);
         float bw = (b.x - a.x - 48 * s) / 2, by = b.y - 70 * s;
         if (Pill("photocancel2", "Cancel", ImVec2(a.x + 16 * s, by), ImVec2(a.x + 16 * s + bw, by + 36 * s), false)) { ClosePreview(); g_photoUi = PhPanel; }
         ImVec2 s0(b.x - 16 * s - bw, by), s1(b.x - 16 * s, by + 36 * s);
@@ -1409,8 +1424,11 @@ static void PhotoScreen(ImVec2 a, ImVec2 b, const sms::Contact* c) {
         DL()->AddRectFilled(s0, s1, !g_behindSheet && ImGui::IsItemHovered() ? Fade(kBlue, 0.85f) : kBlue, 18 * s);
         TextCenter(F_Semi, 14 * s, ImVec2((s0.x + s1.x) * 0.5f, s0.y + 9 * s), white, "Send");
         if (send) {
-            if (Sms_SendPhoto(c->id, g_prevJpeg)) { ClosePreview(); g_photoUi = PhNone; g_chatShown = (size_t)-1; }
-            else { ClosePreview(); g_photoUi = PhPanel; g_photoErrUntil = GetTickCount64() + 4000; }
+            if (Sms_SendPhoto(c->id, g_prevJpeg)) {
+                ClosePreview(); g_photoSendErrUntil = 0; g_photoUi = PhNone; g_chatShown = (size_t)-1;
+            } else {
+                g_photoSendErrUntil = GetTickCount64() + 4000;
+            }
         }
         return;
     }
@@ -1471,8 +1489,10 @@ static void ScreenSmsChat(ImVec2 a, ImVec2 b) {
     bool panel = g_emojiOpen || g_photoUi == PhPanel;
     float barH = 56 * s, panelH = panel ? 250 * s : 0;
     float by0 = panel ? b.y - 14 * s - panelH - barH : b.y - 26 * s - barH;
+    float sendErrH = g_smsSendErr.empty() ? 0.0f : 18 * s;
+    float messagesBottom = by0 - sendErrH;
     ImGui::SetCursorScreenPos(ImVec2(a.x, top + 1));
-    ImGui::BeginChild("##smsmsgs", ImVec2(W, by0 - top - 1), ImGuiChildFlags_None, ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoScrollbar);
+    ImGui::BeginChild("##smsmsgs", ImVec2(W, messagesBottom - top - 1), ImGuiChildFlags_None, ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoScrollbar);
     ImVec2 p0 = ImGui::GetCursorScreenPos();
     float y = p0.y + 10 * s, fs = 15 * s, padX = 12 * s, padY = 7 * s, maxBub = W * 0.72f;
     const auto& msgs = c->msgs;
@@ -1561,6 +1581,8 @@ static void ScreenSmsChat(ImVec2 a, ImVec2 b) {
     if (g_chatShown != msgs.size()) { ImGui::SetScrollHereY(1.0f); g_chatShown = msgs.size(); }
     DragScroll();
     ImGui::EndChild();
+    if (!g_smsSendErr.empty())
+        TextCenter(F_Reg, 11.5f * s, ImVec2(cx, messagesBottom + 2 * s), kRedText(), g_smsSendErr.c_str());
 
     // typing bar: emoji key, text field, send arrow
     float fy0 = by0 + 9 * s, fy1 = by0 + barH - 9 * s, er = (fy1 - fy0) * 0.5f;
@@ -1622,9 +1644,13 @@ static void ScreenSmsChat(ImVec2 a, ImVec2 b) {
     DL()->AddCircleFilled(sc, sr, has ? kBlue : T.divider);
     ArrowUp(sc, sr, IM_COL32(255, 255, 255, 255));
     if ((enter || click) && has) {
-        Sms_Send(c->id, g_draft);
-        g_draft[0] = 0;
-        g_draftCursor = 0;
+        if (Sms_Send(c->id, g_draft)) {
+            g_draft[0] = 0;
+            g_draftCursor = 0;
+            g_smsSendErr.clear();
+        } else {
+            g_smsSendErr = "Couldn't send. Try again.";
+        }
         g_focusDraft = true;   // keep typing
     } else if (enter) g_focusDraft = true;
     if (g_emojiOpen) EmojiPanel(ImVec2(a.x, by0 + barH), ImVec2(b.x, b.y - 14 * s));
@@ -1781,8 +1807,10 @@ static void RoundedRectPoly(ImVec2 a, ImVec2 b, float r, std::vector<ImVec2>& ou
         }
 }
 // Sutherland-Hodgman: the part of convex polygon `poly` inside convex polygon `clip`
-static void ClipConvex(const std::vector<ImVec2>& poly, const std::vector<ImVec2>& clip, std::vector<ImVec2>& out) {
-    std::vector<ImVec2> cur = poly, next;
+static void ClipConvex(const std::vector<ImVec2>& poly, const std::vector<ImVec2>& clip, std::vector<ImVec2>& out,
+                       std::vector<ImVec2>& cur, std::vector<ImVec2>& next) {
+    cur.assign(poly.begin(), poly.end());
+    next.clear();
     for (size_t e = 0; e < clip.size() && !cur.empty(); e++) {
         ImVec2 p = clip[e], q = clip[(e + 1) % clip.size()];
         auto side = [&](ImVec2 v) { return (q.x - p.x) * (v.y - p.y) - (q.y - p.y) * (v.x - p.x); };   // >= 0: inside (clockwise on screen)
@@ -1795,7 +1823,7 @@ static void ClipConvex(const std::vector<ImVec2>& poly, const std::vector<ImVec2
         }
         cur.swap(next);
     }
-    out.swap(cur);
+    out.assign(cur.begin(), cur.end());
 }
 static bool InRoundedRect(ImVec2 v, ImVec2 a, ImVec2 b, float r) {
     if (v.x < a.x || v.x > b.x || v.y < a.y || v.y > b.y) return false;
@@ -1808,7 +1836,8 @@ static void DrawWallpaper(int idx, ImVec2 a, ImVec2 b, float rounding) {
     DL()->AddRectFilled(a, b, Hex(wp.base), rounding);
     float W = b.x - a.x, Hh = b.y - a.y;
     // the lights are cut to the rounded screen exactly, so none spill past its corners
-    std::vector<ImVec2> screen, circle, part;
+    static std::vector<ImVec2> screen, circle, part, cur, next;
+    screen.reserve(44); circle.reserve(64); part.reserve(128); cur.reserve(128); next.reserve(128);
     RoundedRectPoly(a, b, rounding, screen);
     for (const Blob& bl : wp.blobs) {
         if (bl.r <= 0) continue;
@@ -1816,7 +1845,7 @@ static void DrawWallpaper(int idx, ImVec2 a, ImVec2 b, float rounding) {
         float r = W * bl.r;
         circle.clear();
         for (int i = 0; i < 64; i++) { float t = i * 6.2831853f / 64; circle.push_back(ImVec2(c.x + cosf(t) * r, c.y + sinf(t) * r)); }
-        ClipConvex(circle, screen, part);
+        ClipConvex(circle, screen, part, cur, next);
         if (part.size() >= 3) DL()->AddConvexPolyFilled(part.data(), (int)part.size(), bl.col);
     }
     if (wp.stars) {
@@ -2108,15 +2137,10 @@ static void ScreenSettingsApp(const MoneyState& st, ImVec2 a, ImVec2 b) {
     ty += 46 * s;
     Text(F_Reg, 12 * s, ImVec2(p.x + 16 * s, ty), T.sub, "These change your real balance, like a transfer.");
     if (g_cfg.garageResearch) {   // GarageResearch=1: where to look in the steps
-        extern std::atomic<int> g_garageResearchState, g_garageFixCount;
-        int gs = g_garageResearchState, gf = g_garageFixCount;
-        char gl[96];
-        if (g_cfg.garageResearch >= 2) {
-            if (gf < 0) sprintf_s(gl, "Step 2: tap -1,000 in a garage screen");
-            else sprintf_s(gl, "Step 2: %d screen cop%s of your balance updated", gf, gf == 1 ? "y" : "ies");
-        }
+        extern std::atomic<int> g_garageResearchState;
+        int gs = g_garageResearchState;
         Text(F_Semi, 12 * s, ImVec2(p.x + 16 * s, ty + 16 * s), gs == 1 ? kRedText() : T.accent,
-             g_cfg.garageResearch >= 2 ? gl : gs == 1 ? "Research: scanning - wait..." : gs == 2 ? "Research: buy here, back out, tap +1,000" : "Research on: tap -1,000 in a garage screen");
+             gs == 1 ? "Research: scanning - wait..." : gs == 2 ? "Research: buy here, back out, tap +1,000" : "Research on: tap -1,000 in a garage screen");
     }
     p.y += dh + 10 * s;
 
@@ -2254,8 +2278,11 @@ void UI_Draw() {
         g_testBattState = phase == 8 || phase == 1 ? 1 : 2;
     }
 #endif
-    MoneyState st = Money_Snapshot();
-    g_tx = Tx_Snapshot();
+    static MoneyState st;
+    static uint64_t moneyVersion = ~uint64_t(0);
+    Money_Snapshot(moneyVersion, st);
+    static uint64_t txVersion = ~uint64_t(0);
+    Tx_Snapshot(txVersion, g_tx);
     Sms_Snapshot(g_smsView.version, g_smsView);
     PicsPump();
     RadioRefresh();

@@ -8,10 +8,18 @@
 #include "gitmo.h"
 #include <cstdio>
 #include <cstdarg>
+#include <cstdlib>
+#include <cstring>
+#include <cstdint>
 #include <cctype>
+#include <string>
+#include <vector>
 #include <mmsystem.h>
 #include <algorithm>
 #include <cmath>
+#pragma comment(lib, "winmm.lib")
+
+void Watchdog_Start();
 
 extern "C" void* g_real[17] = {};
 static const char* kExports[17] = {
@@ -29,18 +37,69 @@ Settings g_cfg;
 static CRITICAL_SECTION g_logLock;
 static FILE* g_log;
 static size_t g_logBytes;
+static bool g_logFull;
+static const size_t kLogLimit = 5u * 1024 * 1024;
 
+static bool GetModuleFilePath(HMODULE module, std::wstring& path) {
+    path.assign(MAX_PATH, L'\0');
+    for (;;) {
+        DWORD cap = (DWORD)path.size();
+        DWORD n = GetModuleFileNameW(module, &path[0], cap);
+        if (!n) { path.clear(); return false; }
+        if (n < cap) { path.resize(n); return true; }
+        if (path.size() > (size_t)MAXDWORD / 2) {
+            SetLastError(ERROR_FILENAME_EXCED_RANGE);
+            path.clear();
+            return false;
+        }
+        path.resize(path.size() * 2);
+    }
+}
+
+static bool GetSystemDirectoryPath(std::wstring& path) {
+    path.assign(MAX_PATH, L'\0');
+    for (;;) {
+        if (path.size() > MAXDWORD) {
+            SetLastError(ERROR_FILENAME_EXCED_RANGE);
+            path.clear();
+            return false;
+        }
+        UINT cap = (UINT)path.size();
+        UINT n = GetSystemDirectoryW(&path[0], cap);
+        if (!n) { path.clear(); return false; }
+        if (n < cap) { path.resize(n); return true; }
+        if (n == MAXDWORD) {
+            SetLastError(ERROR_FILENAME_EXCED_RANGE);
+            path.clear();
+            return false;
+        }
+        path.resize((size_t)n + 1);
+    }
+}
+
+// The folder this DLL is in (worked out once; paths longer than MAX_PATH are fine).
 std::wstring ModuleDir() {
-    wchar_t p[MAX_PATH];
-    GetModuleFileNameW(g_self, p, MAX_PATH);
-    std::wstring s(p);
-    return s.substr(0, s.find_last_of(L"\\/"));
+    static const std::wstring dir = [] {
+        std::wstring p;
+        if (!GetModuleFilePath(g_self, p)) {
+            OutputDebugStringW(L"Gitmo: unable to get the DLL path.\n");
+            return std::wstring();
+        }
+        size_t slash = p.find_last_of(L"\\/");
+        if (slash == std::wstring::npos) {
+            OutputDebugStringW(L"Gitmo: DLL path has no directory separator.\n");
+            return std::wstring();
+        }
+        p.resize(slash);
+        return p;
+    }();
+    return dir;
 }
 
 void Log(const char* fmt, ...) {
     if (!g_log) return;
     EnterCriticalSection(&g_logLock);
-    if (g_logBytes < 5u * 1024 * 1024) {
+    if (g_logBytes < kLogLimit) {
         SYSTEMTIME t; GetLocalTime(&t);
         int n = fprintf(g_log, "[%02d:%02d:%02d.%03d] ", t.wHour, t.wMinute, t.wSecond, t.wMilliseconds);
         va_list a; va_start(a, fmt);
@@ -49,12 +108,63 @@ void Log(const char* fmt, ...) {
         n += fprintf(g_log, "\n");
         fflush(g_log);
         g_logBytes += n > 0 ? n : 0;
+    } else if (!g_logFull) {   // say so once, instead of going quiet without a word
+        g_logFull = true;
+        fprintf(g_log, "[log limit of 5 MB reached - nothing more is written this session]\n");
+        fflush(g_log);
     }
     LeaveCriticalSection(&g_logLock);
 }
 
+void LogWatchdogReport(const std::string& report) {
+    if (report.empty()) return;
+    if (!g_log || !TryEnterCriticalSection(&g_logLock)) {
+        OutputDebugStringA("Gitmo: watchdog report could not acquire the log; report follows:\n");
+        OutputDebugStringA(report.c_str());
+        return;
+    }
+
+    bool logged = false;
+    if (g_logBytes < kLogLimit) {
+        char prefix[40];
+        SYSTEMTIME t; GetLocalTime(&t);
+        int prefixSize = sprintf_s(prefix, "[%02d:%02d:%02d.%03d] ",
+                                   t.wHour, t.wMinute, t.wSecond, t.wMilliseconds);
+        size_t required = prefixSize > 0 ? (size_t)prefixSize + report.size() + 1 : kLogLimit;
+        if (prefixSize > 0 && required <= kLogLimit - g_logBytes) {
+            size_t written = fwrite(prefix, 1, (size_t)prefixSize, g_log);
+            if (written == (size_t)prefixSize) written += fwrite(report.data(), 1, report.size(), g_log);
+            if (written == (size_t)prefixSize + report.size()) written += fwrite("\n", 1, 1, g_log);
+            g_logBytes += written;
+            logged = written == required && fflush(g_log) == 0;
+        }
+    }
+    LeaveCriticalSection(&g_logLock);
+
+    if (!logged) {
+        OutputDebugStringA("Gitmo: watchdog report was not fully written to Gitmo.log; report follows:\n");
+        OutputDebugStringA(report.c_str());
+    }
+}
+
 // ---- settings -------------------------------------------------------------
-static std::wstring IniPath() { return ModuleDir() + L"\\Gitmo.ini"; }
+static const std::wstring& IniPath() {
+    static const std::wstring p = ModuleDir() + L"\\Gitmo.ini";
+    return p;
+}
+
+// Reading and writing one value of the [Gitmo] section.
+static int IniInt(const wchar_t* key, int def) { return (int)GetPrivateProfileIntW(L"Gitmo", key, def, IniPath().c_str()); }
+static std::wstring IniStr(const wchar_t* key, const wchar_t* def, DWORD cap = 64) {
+    std::wstring s(cap, L'\0');
+    DWORD n = GetPrivateProfileStringW(L"Gitmo", key, def, &s[0], cap, IniPath().c_str());
+    s.resize(n);
+    return s;
+}
+static float IniFloat(const wchar_t* key, const wchar_t* def) { return (float)_wtof(IniStr(key, def).c_str()); }
+static bool Is(const std::wstring& s, const wchar_t* v) { return _wcsicmp(s.c_str(), v) == 0; }
+static void IniSet(const wchar_t* key, const wchar_t* value) { WritePrivateProfileStringW(L"Gitmo", key, value, IniPath().c_str()); }
+static void IniSetF(const wchar_t* key, const wchar_t* fmt, float v) { wchar_t b[32]; swprintf_s(b, fmt, v); IniSet(key, b); }
 
 static const struct { const char* name; int vk; } kKeys[] = {
     {"Delete", VK_DELETE}, {"Insert", VK_INSERT}, {"Home", VK_HOME}, {"End", VK_END},
@@ -76,14 +186,25 @@ std::string KeyName(int vk) {
 }
 
 static int ParseKey(const std::string& s) {
+    if (s.empty()) return 0;
     for (auto& k : kKeys) if (_stricmp(k.name, s.c_str()) == 0) return k.vk;
     if ((s[0] == 'F' || s[0] == 'f') && s.size() > 1 && isdigit((unsigned char)s[1])) {
-        int n = atoi(s.c_str() + 1);
+        int n = 0;
+        for (size_t i = 1; i < s.size(); ++i) {
+            if (!isdigit((unsigned char)s[i])) return 0;
+            n = n * 10 + (s[i] - '0');
+            if (n > 24) return 0;
+        }
         if (n >= 1 && n <= 24) return VK_F1 + n - 1;
     }
     if (_strnicmp(s.c_str(), "Numpad", 6) == 0 && s.size() == 7 && isdigit((unsigned char)s[6])) return VK_NUMPAD0 + (s[6] - '0');
     if (s.size() == 1 && isalnum((unsigned char)s[0])) return toupper((unsigned char)s[0]);
-    if (_strnicmp(s.c_str(), "0x", 2) == 0) { int v = (int)strtol(s.c_str() + 2, nullptr, 16); if (v > 7 && v < 0xFF) return v; }
+    if (_strnicmp(s.c_str(), "0x", 2) == 0 && s.size() > 2) {
+        for (size_t i = 2; i < s.size(); ++i) if (!isxdigit((unsigned char)s[i])) return 0;
+        char* end = nullptr;
+        long v = strtol(s.c_str() + 2, &end, 16);
+        if (end && !*end && v > 7 && v < 0xFF) return (int)v;
+    }
     return 0;
 }
 
@@ -91,7 +212,7 @@ void SaveMenuKey(int vk) {
     g_cfg.menuKey = vk;
     g_cfg.menuKeyName = KeyName(vk);
     std::wstring w(g_cfg.menuKeyName.begin(), g_cfg.menuKeyName.end());
-    WritePrivateProfileStringW(L"Gitmo", L"MenuKey", w.c_str(), IniPath().c_str());
+    IniSet(L"MenuKey", w.c_str());
 }
 
 static const char* kDefaultIni =
@@ -124,7 +245,7 @@ static const char* kDefaultIni =
     "EscapeVia=both\r\n";
 
 static void LoadSettings() {
-    std::wstring ini = IniPath();
+    const std::wstring& ini = IniPath();
     if (GetFileAttributesW(ini.c_str()) == INVALID_FILE_ATTRIBUTES) {
         HANDLE h = CreateFileW(ini.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, 0, nullptr);
         if (h != INVALID_HANDLE_VALUE) {
@@ -132,103 +253,102 @@ static void LoadSettings() {
             CloseHandle(h);
         }
     }
-    const wchar_t* sec = L"Gitmo";
-    g_cfg.enabled  = GetPrivateProfileIntW(sec, L"Enabled", 1, ini.c_str()) != 0;
-    g_cfg.log      = GetPrivateProfileIntW(sec, L"Log", 1, ini.c_str()) != 0;
-    g_cfg.research = GetPrivateProfileIntW(sec, L"Research", 1, ini.c_str()) != 0;
-    wchar_t buf[32];
-    GetPrivateProfileStringW(sec, L"MenuKey", L"Delete", buf, 32, ini.c_str());
-    char key[32]; WideCharToMultiByte(CP_UTF8, 0, buf, -1, key, 32, nullptr, nullptr);
-    if (int vk = key[0] ? ParseKey(key) : 0) { g_cfg.menuKey = vk; g_cfg.menuKeyName = KeyName(vk); }
-    GetPrivateProfileStringW(sec, L"Theme", L"light", buf, 32, ini.c_str());
-    g_cfg.dark = _wcsicmp(buf, L"dark") == 0;
-    GetPrivateProfileStringW(sec, L"PhoneX", L"-1", buf, 32, ini.c_str()); g_cfg.phoneX = (float)_wtof(buf);
-    GetPrivateProfileStringW(sec, L"PhoneY", L"-1", buf, 32, ini.c_str()); g_cfg.phoneY = (float)_wtof(buf);
-    g_cfg.cracked = GetPrivateProfileIntW(sec, L"CrackedScreen", 0, ini.c_str()) != 0;
+    g_cfg.enabled  = IniInt(L"Enabled", 1) != 0;
+    g_cfg.log      = IniInt(L"Log", 1) != 0;
+    g_cfg.research = IniInt(L"Research", 1) != 0;
+    {   // the key is plain ASCII ("Delete", "F8", "0x77")
+        std::string key;
+        for (wchar_t c : IniStr(L"MenuKey", L"Delete")) if (c < 128) key += (char)c;
+        if (int vk = ParseKey(key)) { g_cfg.menuKey = vk; g_cfg.menuKeyName = KeyName(vk); }
+    }
+    g_cfg.dark = Is(IniStr(L"Theme", L"light"), L"dark");
+    g_cfg.phoneX = IniFloat(L"PhoneX", L"-1");
+    g_cfg.phoneY = IniFloat(L"PhoneY", L"-1");
+    g_cfg.cracked = IniInt(L"CrackedScreen", 0) != 0;
     {   // recently used emoji, as hex code points ("1F600,1F44D")
-        wchar_t rb[256] = {};
-        GetPrivateProfileStringW(sec, L"RecentEmoji", L"", rb, 256, ini.c_str());
-        for (wchar_t* q = rb; *q; q++) if (*q < 128) g_cfg.recentEmoji += (char)*q;
+        g_cfg.recentEmoji.clear();
+        for (wchar_t c : IniStr(L"RecentEmoji", L"", 1024)) if (c < 128) g_cfg.recentEmoji += (char)c;
     }
     // notifications: NotifyMode=sound|vibrate|off (older Gitmo: NotifySound=1/0)
-    GetPrivateProfileStringW(sec, L"NotifyMode", L"", buf, 32, ini.c_str());
-    if (!_wcsicmp(buf, L"vibrate")) g_cfg.notifyMode = 1;
-    else if (!_wcsicmp(buf, L"off")) g_cfg.notifyMode = 2;
-    else if (!_wcsicmp(buf, L"sound")) g_cfg.notifyMode = 0;
-    else g_cfg.notifyMode = GetPrivateProfileIntW(sec, L"NotifySound", 1, ini.c_str()) != 0 ? 0 : 2;
-    g_cfg.sessionOnly = GetPrivateProfileIntW(sec, L"SessionOnly", 1, ini.c_str()) != 0;
-    g_cfg.sessionResearch = GetPrivateProfileIntW(sec, L"SessionResearch", 0, ini.c_str());
-    g_cfg.moneyResearch = GetPrivateProfileIntW(sec, L"MoneyResearch", 0, ini.c_str()) != 0;
-    g_cfg.garageResearch = (int)GetPrivateProfileIntW(sec, L"GarageResearch", 0, ini.c_str());
-    g_cfg.escapeOnSend = GetPrivateProfileIntW(sec, L"EscapeOnSend", 1, ini.c_str()) != 0;
-    GetPrivateProfileStringW(sec, L"EscapeVia", L"both", buf, 32, ini.c_str());
-    g_cfg.escapeVia = !_wcsicmp(buf, L"directinput") ? 1 : !_wcsicmp(buf, L"window") ? 2 : 0;
-    g_cfg.developer = GetPrivateProfileIntW(sec, L"Developer", 0, ini.c_str()) != 0;
-    GetPrivateProfileStringW(sec, L"PhoneSize", L"medium", buf, 32, ini.c_str());
-    g_cfg.phoneSize = _wcsicmp(buf, L"small") == 0 ? 0 : _wcsicmp(buf, L"large") == 0 ? 2 : 1;
-    g_cfg.wallpaper = std::min(std::max((int)GetPrivateProfileIntW(sec, L"Wallpaper", 0, ini.c_str()), 0), 4);
-    GetPrivateProfileStringW(sec, L"BatteryMinutes", L"15", buf, 32, ini.c_str()); g_cfg.batteryMin = (float)_wtof(buf);
-    GetPrivateProfileStringW(sec, L"Display", L"auto", buf, 32, ini.c_str());
-    g_cfg.display = _wcsicmp(buf, L"screen") == 0 ? 1 : _wcsicmp(buf, L"headset") == 0 ? 2 : 0;
-    GetPrivateProfileStringW(sec, L"VrDistance", L"0.60", buf, 32, ini.c_str());
-    g_cfg.vrDistance = std::min(std::max((float)_wtof(buf), 0.25f), 3.0f);
-    GetPrivateProfileStringW(sec, L"VrPointerSpeed", L"2.0", buf, 32, ini.c_str());
-    g_cfg.vrPointerSpeed = std::min(std::max((float)_wtof(buf), 0.5f), 6.0f);
-    g_cfg.savePhotos = GetPrivateProfileIntW(sec, L"SavePhotos", GetPrivateProfileIntW(sec, L"SavePhotosToSteam", 1, ini.c_str()), ini.c_str()) != 0;
+    std::wstring nm = IniStr(L"NotifyMode", L"");
+    if (Is(nm, L"vibrate")) g_cfg.notifyMode = 1;
+    else if (Is(nm, L"off")) g_cfg.notifyMode = 2;
+    else if (Is(nm, L"sound")) g_cfg.notifyMode = 0;
+    else g_cfg.notifyMode = IniInt(L"NotifySound", 1) != 0 ? 0 : 2;
+    g_cfg.sessionOnly = IniInt(L"SessionOnly", 1) != 0;
+    g_cfg.sessionResearch = IniInt(L"SessionResearch", 0);
+    g_cfg.moneyResearch = IniInt(L"MoneyResearch", 0) != 0;
+    g_cfg.garageResearch = IniInt(L"GarageResearch", 0);
+    g_cfg.escapeOnSend = IniInt(L"EscapeOnSend", 1) != 0;
+    std::wstring via = IniStr(L"EscapeVia", L"both");
+    g_cfg.escapeVia = Is(via, L"directinput") ? 1 : Is(via, L"window") ? 2 : 0;
+    g_cfg.developer = IniInt(L"Developer", 0) != 0;
+    std::wstring size = IniStr(L"PhoneSize", L"medium");
+    g_cfg.phoneSize = Is(size, L"small") ? 0 : Is(size, L"large") ? 2 : 1;
+    g_cfg.wallpaper = std::min(std::max(IniInt(L"Wallpaper", 0), 0), 4);
+    g_cfg.batteryMin = IniFloat(L"BatteryMinutes", L"15");
+    std::wstring disp = IniStr(L"Display", L"auto");
+    g_cfg.display = Is(disp, L"screen") ? 1 : Is(disp, L"headset") ? 2 : 0;
+    g_cfg.vrDistance = std::min(std::max(IniFloat(L"VrDistance", L"0.60"), 0.25f), 3.0f);
+    g_cfg.vrPointerSpeed = std::min(std::max(IniFloat(L"VrPointerSpeed", L"2.0"), 0.5f), 6.0f);
+    g_cfg.savePhotos = IniInt(L"SavePhotos", IniInt(L"SavePhotosToSteam", 1)) != 0;
     // optional overrides, only needed if a game update moves these fields (hex like 0x768 accepted)
-    GetPrivateProfileStringW(sec, L"EngineOffset", L"", buf, 32, ini.c_str()); if (buf[0]) g_cfg.engineOffset = (int)wcstol(buf, nullptr, 0);
-    GetPrivateProfileStringW(sec, L"GarageOffset", L"", buf, 32, ini.c_str()); if (buf[0]) g_cfg.garageOffset = (int)wcstol(buf, nullptr, 0);
+    std::wstring s = IniStr(L"EngineOffset", L"");
+    if (!s.empty()) g_cfg.engineOffset = (int)wcstol(s.c_str(), nullptr, 0);
+    s = IniStr(L"GarageOffset", L"");
+    if (!s.empty()) g_cfg.garageOffset = (int)wcstol(s.c_str(), nullptr, 0);
 }
 
 void SavePhonePos(float x, float y) {
     g_cfg.phoneX = x; g_cfg.phoneY = y;
-    wchar_t b[32];
-    swprintf_s(b, L"%.4f", x); WritePrivateProfileStringW(L"Gitmo", L"PhoneX", b, IniPath().c_str());
-    swprintf_s(b, L"%.4f", y); WritePrivateProfileStringW(L"Gitmo", L"PhoneY", b, IniPath().c_str());
+    IniSetF(L"PhoneX", L"%.4f", x);
+    IniSetF(L"PhoneY", L"%.4f", y);
 }
 
 void SaveCracked(bool on) {
     g_cfg.cracked = on;
-    WritePrivateProfileStringW(L"Gitmo", L"CrackedScreen", on ? L"1" : L"0", IniPath().c_str());
+    IniSet(L"CrackedScreen", on ? L"1" : L"0");
 }
 
 void SaveRecentEmoji(const std::string& hexList) {
     g_cfg.recentEmoji = hexList;
     std::wstring w(hexList.begin(), hexList.end());
-    WritePrivateProfileStringW(L"Gitmo", L"RecentEmoji", w.c_str(), IniPath().c_str());
+    IniSet(L"RecentEmoji", w.c_str());
 }
 
 void SaveWallpaper(int i) {
     g_cfg.wallpaper = i;
-    WritePrivateProfileStringW(L"Gitmo", L"Wallpaper", std::to_wstring(i).c_str(), IniPath().c_str());
+    IniSet(L"Wallpaper", std::to_wstring(i).c_str());
 }
 
 void SavePhoneSize(int i) {
     g_cfg.phoneSize = i;
-    WritePrivateProfileStringW(L"Gitmo", L"PhoneSize", i == 0 ? L"small" : i == 2 ? L"large" : L"medium", IniPath().c_str());
+    IniSet(L"PhoneSize", i == 0 ? L"small" : i == 2 ? L"large" : L"medium");
 }
 
 void SaveDisplay(int mode) {
     g_cfg.display = mode;
-    WritePrivateProfileStringW(L"Gitmo", L"Display", mode == 1 ? L"screen" : mode == 2 ? L"headset" : L"auto", IniPath().c_str());
+    IniSet(L"Display", mode == 1 ? L"screen" : mode == 2 ? L"headset" : L"auto");
 }
 
 void SaveVrDistance(float m) {
     g_cfg.vrDistance = m;
-    wchar_t b[32]; swprintf_s(b, L"%.2f", m);
-    WritePrivateProfileStringW(L"Gitmo", L"VrDistance", b, IniPath().c_str());
+    IniSetF(L"VrDistance", L"%.2f", m);
 }
 
 void SaveVrPointerSpeed(float v) {
     g_cfg.vrPointerSpeed = v;
-    wchar_t b[32]; swprintf_s(b, L"%.1f", v);
-    WritePrivateProfileStringW(L"Gitmo", L"VrPointerSpeed", b, IniPath().c_str());
+    IniSetF(L"VrPointerSpeed", L"%.1f", v);
 }
 
 void SaveNotifyMode(int mode) {
     g_cfg.notifyMode = mode;
-    WritePrivateProfileStringW(L"Gitmo", L"NotifyMode", mode == 1 ? L"vibrate" : mode == 2 ? L"off" : L"sound", IniPath().c_str());
+    IniSet(L"NotifyMode", mode == 1 ? L"vibrate" : mode == 2 ? L"off" : L"sound");
 }
+
+void SaveBattery(float minutes) { IniSetF(L"BatteryMinutes", L"%.2f", minutes); }
+
+void SaveThemeSetting(bool dark) { IniSet(L"Theme", dark ? L"dark" : L"light"); }
 
 // "Vibrate": a phone's buzz-buzz on a table, made here as a WAV (two short rattles).
 static const std::vector<uint8_t>& VibrateWav() {
@@ -261,35 +381,29 @@ static const std::vector<uint8_t>& VibrateWav() {
 }
 void Notify_Vibrate() { PlaySoundW((LPCWSTR)VibrateWav().data(), nullptr, SND_MEMORY | SND_ASYNC | SND_NODEFAULT); }
 
+// The notification sound is built into the DLL (resource "NOTIFY", type WAVE). A file called
+// Gitmo-notify.wav next to the DLL replaces it, for anyone who wants a different sound.
+void Notify_Play() {
+    static const std::wstring custom = ModuleDir() + L"\\Gitmo-notify.wav";
+    if (GetFileAttributesW(custom.c_str()) != INVALID_FILE_ATTRIBUTES &&
+        PlaySoundW(custom.c_str(), nullptr, SND_FILENAME | SND_ASYNC | SND_NODEFAULT)) return;
+    static const void* wav = [] {   // looked up once; stays mapped as long as the DLL is loaded
+        HRSRC r = FindResourceW(g_self, L"NOTIFY", L"WAVE");
+        HGLOBAL h = r ? LoadResource(g_self, r) : nullptr;
+        return h ? LockResource(h) : nullptr;
+    }();
+    if (!wav || !PlaySoundW((LPCWSTR)wav, nullptr, SND_MEMORY | SND_ASYNC | SND_NODEFAULT)) MessageBeep(MB_ICONASTERISK);
+}
+
 // what an incoming money transfer or message does, by the Notifications setting
 void Notify_Alert() {
     if (g_cfg.notifyMode == 0) Notify_Play();
     else if (g_cfg.notifyMode == 1) Notify_Vibrate();
 }
 
-// The notification sound is built into the DLL (resource "NOTIFY", type WAVE). A file called
-// Gitmo-notify.wav next to the DLL replaces it, for anyone who wants a different sound.
-void Notify_Play() {
-    std::wstring custom = ModuleDir() + L"\\Gitmo-notify.wav";
-    if (GetFileAttributesW(custom.c_str()) != INVALID_FILE_ATTRIBUTES &&
-        PlaySoundW(custom.c_str(), nullptr, SND_FILENAME | SND_ASYNC | SND_NODEFAULT)) return;
-    HRSRC r = FindResourceW(g_self, L"NOTIFY", L"WAVE");
-    HGLOBAL h = r ? LoadResource(g_self, r) : nullptr;
-    const void* wav = h ? LockResource(h) : nullptr;   // stays mapped as long as the DLL is loaded
-    if (!wav || !PlaySoundW((LPCWSTR)wav, nullptr, SND_MEMORY | SND_ASYNC | SND_NODEFAULT)) MessageBeep(MB_ICONASTERISK);
-}
-
-void SaveBattery(float minutes) {
-    wchar_t b[32]; swprintf_s(b, L"%.2f", minutes);
-    WritePrivateProfileStringW(L"Gitmo", L"BatteryMinutes", b, IniPath().c_str());
-}
-
-void SaveThemeSetting(bool dark) {
-    WritePrivateProfileStringW(L"Gitmo", L"Theme", dark ? L"dark" : L"light", IniPath().c_str());
-}
-
 // ---- startup ----------------------------------------------------------------
 static DWORD WINAPI InitThread(LPVOID) {
+    if (ModuleDir().empty()) return ERROR_PATH_NOT_FOUND;
     LoadSettings();
     if (g_cfg.log) {
         // keep the previous session's log, so a launch that froze or crashed can still be read
@@ -313,11 +427,21 @@ static DWORD WINAPI InitThread(LPVOID) {
     // installed, so flat-screen players get nothing extra. Display=screen in Gitmo.ini (or
     // on the phone) keeps the phone on the flat screen even then.
     {
-        wchar_t exeDir[MAX_PATH]; GetModuleFileNameW(nullptr, exeDir, MAX_PATH);
-        *(wcsrchr(exeDir, L'\\') + 1) = 0;
-        bool vrMod = GetFileAttributesW((std::wstring(exeDir) + L"dxgi.dll").c_str()) != INVALID_FILE_ATTRIBUTES;
-        bool allowed = GetPrivateProfileIntW(L"Gitmo", L"VrPanel", 1, IniPath().c_str()) != 0;
-        if (!vrMod) Log("vr: no VR mod next to the game -> flat-screen phone");
+        bool vrMod = false;
+        bool vrPathKnown = false;
+        std::wstring exePath;
+        if (GetModuleFilePath(nullptr, exePath)) {
+            size_t slash = exePath.find_last_of(L"\\/");
+            if (slash != std::wstring::npos) {
+                exePath.resize(slash + 1);
+                exePath += L"dxgi.dll";
+                vrMod = GetFileAttributesW(exePath.c_str()) != INVALID_FILE_ATTRIBUTES;
+                vrPathKnown = true;
+            }
+        }
+        bool allowed = IniInt(L"VrPanel", 1) != 0;
+        if (!vrPathKnown) Log("vr: unable to resolve the game path -> headset panel off");
+        else if (!vrMod) Log("vr: no VR mod next to the game -> flat-screen phone");
         else if (!allowed) Log("vr: VrPanel=0 in Gitmo.ini -> headset panel off");
         else VR_Start();
     }
@@ -329,9 +453,9 @@ static DWORD WINAPI InitThread(LPVOID) {
     if (g_cfg.moneyResearch) MoneyWatch_Start();
     Game_Start();
     // Transfers between players over Steam (Transfers=0 in Gitmo.ini turns them off).
-    if (GetPrivateProfileIntW(L"Gitmo", L"Transfers", 1, IniPath().c_str())) Tx_Start();
+    if (IniInt(L"Transfers", 1)) Tx_Start();
     else Log("transfers: Transfers=0 in Gitmo.ini -> off");
-    void Watchdog_Start(); Watchdog_Start();
+    Watchdog_Start();
     return 0;
 }
 
@@ -339,14 +463,22 @@ BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) {
         g_self = h;
         DisableThreadLibraryCalls(h);
+        std::wstring sys;
+        if (!GetSystemDirectoryPath(sys)) {
+            OutputDebugStringW(L"Gitmo: unable to get the Windows system directory.\n");
+            return FALSE;
+        }
+        sys += L"\\version.dll";
+        HMODULE real = LoadLibraryW(sys.c_str());
+        if (!real) {
+            OutputDebugStringW(L"Gitmo: unable to load the system version.dll.\n");
+            return FALSE;
+        }
         InitializeCriticalSection(&g_logLock);
-        wchar_t sys[MAX_PATH];
-        GetSystemDirectoryW(sys, MAX_PATH);
-        wcscat_s(sys, L"\\version.dll");
-        HMODULE real = LoadLibraryW(sys);
-        if (!real) return FALSE;
         for (int i = 0; i < 17; i++) g_real[i] = (void*)GetProcAddress(real, kExports[i]);
         if (HANDLE t = CreateThread(nullptr, 0, InitThread, nullptr, 0, nullptr)) CloseHandle(t);
+    } else if (reason == DLL_PROCESS_DETACH) {
+        Game_Stop();
     }
     return TRUE;
 }

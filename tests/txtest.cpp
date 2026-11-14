@@ -1,5 +1,6 @@
 // Protocol test for Gitmo transfers: simulated players over a lossy network.
 #include "transfer.h"
+#include "shared.h"
 #include <cstdio>
 #include <memory>
 #include <set>
@@ -30,7 +31,8 @@ struct Net {
 
 struct Player {
     uint64_t sid; std::string name;
-    long long money; bool inMap = true; bool failWrites = false; bool inGarage = false;
+    long long money; bool inMap = true; bool failWrites = false; bool failPersistNext = false;
+    int failPersistAfter = -1; bool inGarage = false;
     std::string disk;
     std::unique_ptr<Engine> e;
     std::set<uint64_t> acceptedIds, creditedIds;   // harness bookkeeping (truth)
@@ -51,7 +53,13 @@ void Player::Boot() {
     io.balance = [this]() { return inMap ? money : -1LL; };
     io.mayPay = [this]() { return !inGarage; };
     io.ring = [] {};
-    io.persist = [this](const std::string& s) { disk = s; };
+    io.persist = [this](const std::string& s) {
+        if (failPersistNext) { failPersistNext = false; return false; }
+        if (failPersistAfter == 0) { failPersistAfter = -1; return false; }
+        if (failPersistAfter > 0) --failPersistAfter;
+        disk = s;
+        return true;
+    };
     io.now = [] { return g_now; };
     io.wallclock = [] { return (long long)(1700000000 + g_now / 1000); };
     io.newId = [] { return ++g_idc * 0x9E3779B97F4A7C15ull | 1; };
@@ -98,7 +106,8 @@ static Out StateOf(Player& p, uint64_t id) { const Outgoing* o = p.e->FindOut(id
 
 int main(int argc, char**) {
     quiet = argc < 2;
-    if (const char* sd = getenv("SEED")) rng.seed(strtoull(sd, nullptr, 10));
+    std::string seed;
+    if (gitmo_shared::GetEnvironmentVariable("SEED", seed)) rng.seed(strtoull(seed.c_str(), nullptr, 10));
     Player A{ 76561198000000001ull, "Ann", 10000 }, B{ 76561198000000002ull, "Bob", 500 }, C{ 76561198000000003ull, "Cat", 0 };
     players = { &A, &B, &C };
     for (auto* p : players) p->Boot();
@@ -109,7 +118,8 @@ int main(int argc, char**) {
     // --- 2. happy path
     Check("2a. send $1,000 to Bob", A.e->Send(B.sid, 1000, &id) == SendResult::Ok);
     Step(300);
-    Check("2b. Bob sees the request, nothing moved yet", PromptOf(B) && PromptOf(B)->amount == 1000 && A.money == 10000 && B.money == 500);
+    Check("2b. Bob sees the request, nothing moved yet",
+          PromptOf(B) && PromptOf(B)->amount == 1000 && B.e->PromptCount() == 1 && A.money == 10000 && B.money == 500);
     Check("2c. Ann's phone says waiting (Asked)", StateOf(A, id) == Out::Asked);
     B.e->Accept(A.sid, PromptOf(B)->id);
     Step(500);
@@ -270,6 +280,9 @@ int main(int argc, char**) {
         //     still show the old balance, so the money could be spent twice)
         A.money = 5000; B.money = 5000;
         uint64_t sid = 0;
+        A.inGarage = true;
+        Check("16. sending while already in a garage is refused", A.e->Send(B.sid, 1000) == SendResult::InGarage);
+        A.inGarage = false;
         Check("16a. Ann sends outside the garage", A.e->Send(B.sid, 1000, &sid) == SendResult::Ok);
         Step(300);
         A.inGarage = true;   // ...then drives into a garage before Bob answers
@@ -282,6 +295,77 @@ int main(int argc, char**) {
         Check("16d. ... and arrives", A.money == 4000 && B.money == 6000 && StateOf(A, sid) == Out::Done);
         Step(80000);
         Check("16e. all settled", Settled());
+    }
+    // --- 17. a failed transfer-state write must not leave an untracked money change
+    {
+        long long oldA = A.money, oldB = B.money;
+        A.money = B.money = 5000;
+        uint64_t sid = 0;
+        Check("17a. start a transfer whose sender state write will fail", A.e->Send(B.sid, 600, &sid) == SendResult::Ok);
+        Step(300);
+        A.failPersistNext = true;
+        if (auto* pr = PromptOf(B)) B.e->Accept(A.sid, pr->id);
+        Step(1000);
+        Check("17b. failed sender persistence rolls the debit back", StateOf(A, sid) == Out::Failed && A.money == 5000 && B.money == 5000);
+
+        Check("17c. start a transfer whose receiver state write will fail once", A.e->Send(B.sid, 700, &sid) == SendResult::Ok);
+        Step(300);
+        B.failPersistNext = true;
+        if (auto* pr = PromptOf(B)) B.e->Accept(A.sid, pr->id);
+        Step(6000);
+        Check("17d. receiver retries after rolling back an unsaved credit", StateOf(A, sid) == Out::Done
+              && A.money == 4300 && B.money == 5700);
+        A.money = oldA; B.money = oldB;
+    }
+    // --- 18. a failed refund-state write cannot leave a refund applied but untracked
+    {
+        long long oldA = A.money, oldB = B.money;
+        A.money = B.money = 5000;
+        uint64_t sid = 0;
+        Check("18a. start a transfer whose receiver cannot credit", A.e->Send(B.sid, 500, &sid) == SendResult::Ok);
+        Step(300);
+        net.drop = "VOID";
+        B.failWrites = true;
+        if (auto* pr = PromptOf(B)) B.e->Accept(A.sid, pr->id);
+        Step(500);
+        net.drop.clear(); net.q.clear();
+        B.failWrites = false;
+        char idText[32];
+        sprintf_s(idText, "%llx", (unsigned long long)sid);
+        A.failPersistAfter = 1;
+        A.e->OnMessage(B.sid, std::string("G1|VOID|") + idText + "|500|");
+        Check("18b. unsaved refund is rolled back and remains due", StateOf(A, sid) == Out::RefundDue
+              && A.money == 4500 && B.money == 5000);
+        Step(5000);
+        Check("18c. refund retries and settles exactly once", StateOf(A, sid) == Out::Refunded
+              && A.money == 5000 && B.money == 5000);
+        A.money = oldA; B.money = oldB;
+    }
+    // --- 19. malformed fields cannot be partially parsed into protocol state
+    {
+        size_t inBefore = A.e->Ins().size(), outBefore = A.e->Outs().size();
+        A.e->OnMessage(B.sid, "G1|OFFER|12zz|10|Bob");
+        A.e->OnMessage(B.sid, "G1|OFFER|1234|10junk|Bob");
+        A.e->OnMessage(B.sid, "G1|UNKNOWN|1234|10|Bob");
+        A.e->Load("OUT 2 12zz 10 P Bob\nOUT 2 1234 999999999 P Bob\nIN 2 1234 10 nope Bob\n");
+        Check("19. malformed network and saved-state fields are ignored",
+              A.e->Ins().size() == inBefore && A.e->Outs().size() == outBefore);
+    }
+    // --- 20. unread canceled requests stay bounded
+    {
+        for (uint64_t n = 0; n < 300; ++n) {
+            char idText[32];
+            sprintf_s(idText, "%llx", (unsigned long long)(0x500000 + n));
+            std::string offer = std::string("G1|OFFER|") + idText + "|1|Bob";
+            std::string cancel = std::string("G1|CANCEL|") + idText + "|1|";
+            A.e->OnMessage(B.sid, offer);
+            A.e->OnMessage(B.sid, cancel);
+            A.e->Tick();
+        }
+        size_t unseenFinal = 0;
+        for (const auto& i : A.e->Ins())
+            if (i.st != In::Credited && InFinal(i.st) && !i.seen) ++unseenFinal;
+        Check("20. unread terminal request history is capped", unseenFinal <= 256);
     }
     printf("%s\n", fails ? "SOME TESTS FAILED" : "ALL PASSED");
     return fails;
