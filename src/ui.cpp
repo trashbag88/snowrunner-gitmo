@@ -91,6 +91,32 @@ static bool Hit(const char* id, ImVec2 a, ImVec2 b) {
     return ImGui::InvisibleButton(id, ImVec2(b.x - a.x, b.y - a.y));
 }
 
+// Sheets (an incoming transfer, the share sheet...) and the cracked glass are drawn in a child
+// window of their own, begun after the screen's content. ImGui draws child windows - the SMS
+// chat, the lists, Settings - over their parent's own drawing, and the topmost window gets the
+// mouse, so a sheet drawn straight onto the phone would sit behind those lists and lose its
+// clicks to them. inputs=false lets the mouse through (the glass).
+#ifdef GITMO_TEST
+static bool OldSheets() { static int v = getenv("GITMO_TEST_OLDSHEETS") ? 1 : 0; return v != 0; }   // A/B: draw sheets the 0.9.11 way
+#endif
+static void BeginOverlay(const char* id, ImVec2 a, ImVec2 b, bool inputs) {
+#ifdef GITMO_TEST
+    if (OldSheets()) return;
+#endif
+    ImGui::SetCursorScreenPos(a);
+    ImGuiWindowFlags f = ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse;
+    if (!inputs) f |= ImGuiWindowFlags_NoInputs;
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
+    ImGui::BeginChild(id, ImVec2(b.x - a.x, b.y - a.y), ImGuiChildFlags_None, f);
+    ImGui::PopStyleVar();
+}
+static void EndOverlay() {
+#ifdef GITMO_TEST
+    if (OldSheets()) return;
+#endif
+    ImGui::EndChild();
+}
+
 // Drag to scroll, like a phone: press anywhere in a list and move up or down. Once the press
 // has moved a few pixels it is a scroll, and the button it started on doesn't fire. (In VR
 // this is the main way to scroll; the mouse wheel works too.) Call just before EndChild().
@@ -807,7 +833,12 @@ static void IncomingSheet(const tx::Incoming& in, ImVec2 a, ImVec2 b) {
         TextCenter(F_Reg, 13 * s, ImVec2(cx, y + 19 * s), T.sub, t);
         float mid = (bl.x + br.x) * 0.5f;
         if (Pill("decline", "Decline", bl, ImVec2(mid - 6 * s, br.y), false)) Tx_Decline(in.peer, in.id);
-        if (Pill("accept", "Accept", ImVec2(mid + 6 * s, bl.y), br, true)) Tx_Accept(in.peer, in.id);
+        bool acc = Pill("accept", "Accept", ImVec2(mid + 6 * s, bl.y), br, true);
+#ifdef GITMO_TEST
+        { extern ImVec2 g_testSheetBtnA, g_testSheetBtnB; extern int g_testSheetClicks;
+          g_testSheetBtnA = ImVec2(mid + 6 * s, bl.y); g_testSheetBtnB = br; if (acc) g_testSheetClicks++; }
+#endif
+        if (acc) Tx_Accept(in.peer, in.id);
         return;
     }
     if (in.st == tx::In::Accepted) {
@@ -834,7 +865,12 @@ static void IncomingSheet(const tx::Incoming& in, ImVec2 a, ImVec2 b) {
     std::string l1 = got ? "from " + n : canceled ? n + " canceled it before it was sent." : timedOut ? "It ran out of time." : n + " canceled it, or it ran out of time.";
     TextCenter(F_Reg, 13 * s, ImVec2(cx, y), T.sub, l1.c_str());
     if (!got) TextCenter(F_Reg, 13 * s, ImVec2(cx, y + 19 * s), T.sub, "Nothing changed.");
-    if (Pill("okin", "OK", bl, br, true)) Tx_MarkSeen(in.peer, in.id);
+    bool ok = Pill("okin", "OK", bl, br, true);
+#ifdef GITMO_TEST
+    { extern ImVec2 g_testSheetBtnA, g_testSheetBtnB; extern int g_testSheetClicks;
+      g_testSheetBtnA = bl; g_testSheetBtnB = br; if (ok) g_testSheetClicks++; }
+#endif
+    if (ok) Tx_MarkSeen(in.peer, in.id);
 }
 
 #ifdef GITMO_TEST
@@ -850,9 +886,9 @@ static TxView DemoTx(int phase) {
     if (phase == 11) { o.st = tx::Out::Asked; v.outs.push_back(o); }
     if (phase == 13) { o.st = tx::Out::Done; v.outs.push_back(o); }
     tx::Incoming i; i.peer = 2; i.id = 0x22; i.amount = 4000; i.name = "Bob"; i.created = now - 9000;
-    if (phase == 12) { i.st = tx::In::Prompt; v.ins.push_back(i); }
+    if (phase == 12 || phase == 46) { i.st = tx::In::Prompt; v.ins.push_back(i); }
     if (phase == 14) { i.st = tx::In::Credited; i.seen = false; v.ins.push_back(i); }
-    if (phase == 44) { i.st = tx::In::Void; i.seen = false; i.why = "Bob canceled"; v.ins.push_back(i); }
+    if (phase == 44 || phase == 48 || phase == 49) { i.st = tx::In::Void; i.seen = false; i.why = "Bob canceled"; v.ins.push_back(i); }
     return v;
 }
 #endif
@@ -2191,8 +2227,10 @@ void UI_Draw() {
     if (phase != lastPhase && phase >= 35) {
         lastPhase = phase;
         g_sheet = false; g_captureKey = false; g_cfg.cracked = false; g_chat = 0; g_emojiOpen = false; g_photoUi = PhNone;
-        g_app = phase == 35 ? Drawer : phase == 43 ? SmsApp : phase == 44 ? GitmoApp : RadioApp;
-        if (phase == 43) g_chat = 2;
+        // 48: "Transfer canceled" over the SMS contact list, 49: over Settings (both lists reach the OK button)
+        g_app = phase == 35 ? Drawer : phase == 43 || phase == 46 || phase == 48 ? SmsApp : phase == 44 ? GitmoApp : phase == 47 || phase == 49 ? SettingsApp : RadioApp;
+        if (phase == 43 || phase == 46) g_chat = 2;   // 46: a transfer request over the chat, with cracked glass
+        if (phase == 46 || phase == 47) g_cfg.cracked = true;   // 47: the glass over the Settings list
         if (phase == 44) g_screen = Home;
         g_radShare = phase == 41;
         g_radTab = phase == 40 ? 1 : 0; g_radEdit = phase == 36 ? false : g_radEdit;
@@ -2377,10 +2415,10 @@ void UI_Draw() {
             HomePill(a, b, T.text);
         }
         g_behindSheet = false;
-        if (g_sheet && !incoming) Sheet(a, b);
+        if (g_sheet && !incoming) { BeginOverlay("##sheetov", a, b, true); Sheet(a, b); EndOverlay(); }
     }
-    if (incoming) IncomingSheet(*incoming, a, b);
-    if (g_cfg.cracked) DrawCracks(a, b);
+    if (incoming) { BeginOverlay("##incomingov", a, b, true); IncomingSheet(*incoming, a, b); EndOverlay(); }
+    if (g_cfg.cracked) { BeginOverlay("##glassov", a, b, false); DrawCracks(a, b); EndOverlay(); }
     ImGui::End();
     // the SMS engine marks messages read only while their conversation is really on screen
     if (g_viewSent && (g_dead || g_app != SmsApp || g_chat != g_viewSent)) { Sms_Viewing(0); g_viewSent = 0; }

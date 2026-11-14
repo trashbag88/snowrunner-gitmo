@@ -1,5 +1,5 @@
 ===============================================================================
-  Gitmo for SnowRunner  v0.9.11 (transfers, text messages, photos and radio)
+  Gitmo for SnowRunner  v0.9.12 (transfers, text messages, photos and radio)
 ===============================================================================
 
 WHAT IT IS
@@ -220,6 +220,10 @@ transfer is still "settling" on the Send screen.)
 
 VERSION HISTORY
 ---------------
+  0.9.12 Transfer requests and other pop-up cards now always show on top: in
+         SMS, Settings and the lists they were drawn behind them, and their
+         buttons only worked on a thin strip. The cracked glass covers those
+         screens too.
   0.9.11 New built-in notification sound (a chime made for Gitmo). Your own
          sound still works: Gitmo-notify.wav next to the game.
   0.9.10 Photos taken with the phone: on Steam they go into your Steam

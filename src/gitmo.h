@@ -9,7 +9,7 @@
 #include <mutex>
 #include <atomic>
 
-#define GITMO_VERSION "0.9.11"
+#define GITMO_VERSION "0.9.12"
 
 // ---- core (gitmo.cpp) ------------------------------------------------------
 void Log(const char* fmt, ...);

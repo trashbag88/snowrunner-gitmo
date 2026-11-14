@@ -617,7 +617,7 @@ static void ScreenRadio(ImVec2 a, ImVec2 b) {
     else if (g_radScr == RForm) RadioForm(a, b);
     else RadioList(a, b);
     g_behindSheet = before;
-    if (g_radShare && !before) RadioShareSheet(a, b);
+    if (g_radShare && !before) { BeginOverlay("##radshareov", a, b, true); RadioShareSheet(a, b); EndOverlay(); }
     if (GetTickCount64() < g_radToastUntil && !g_radToast.empty()) {   // a short note: "Station added"
         float cx = (a.x + b.x) * 0.5f, tw = Measure(F_Semi, 13 * s, g_radToast.c_str()).x + 32 * s, ty = b.y - 110 * s;
         DL()->AddRectFilled(ImVec2(cx - tw / 2, ty), ImVec2(cx + tw / 2, ty + 34 * s), Fade(T.text, 0.88f), 17 * s);

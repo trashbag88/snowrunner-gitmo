@@ -229,6 +229,7 @@ ImVec2 g_testEmojiKey, g_testEmojiCell;   // phase 23: the smiley key, and the f
 bool g_testEmojiOpen; char g_testDraftCopy[400];
 ImVec2 g_testSettingsMid; float g_testSettingsScroll; int g_testWallpaperNow;   // phase 30: drag-to-scroll
 ImVec2 g_testCameraKey, g_testTakePhoto;   // phase 33: tap "Take photo"
+ImVec2 g_testSheetBtnA, g_testSheetBtnB; int g_testSheetClicks;   // phases 46, 48, 49: the transfer sheet's main button
 float g_testBattery = -1; int g_testBattState;
 static void TestCapture(IDXGISwapChain* sc, int n) {
     ID3D11Texture2D* bb = nullptr;
@@ -410,6 +411,17 @@ static void OverlayFrame(IDXGISwapChain* sc) {
         if (ph == 30 && k == 40) Log("test: settings scroll before the drag %.0f, wallpaper %d", g_testSettingsScroll, g_testWallpaperNow);
         if (ph == 30 && k >= 60 && k < 150) { mx = g_testSettingsMid.x; my = g_testSettingsMid.y - std::min(k - 61, 80) * 4.0f; lmb = k >= 61 && k <= 145; }
         if (ph == 33 && k >= 60 && k < 66) { mx = g_testTakePhoto.x; my = g_testTakePhoto.y; lmb = k >= 61 && k <= 62; }
+        // phases 46/48/49: click the transfer sheet's button at 5 spots across it (left edge to
+        // right edge, upper part) - every one must land, even where a list lies underneath
+        if ((ph == 46 || ph == 48 || ph == 49) && k == 50) g_testSheetClicks = 0;
+        if ((ph == 46 || ph == 48 || ph == 49) && k >= 60 && k < 110) {
+            int spot = (k - 60) / 10, t = (k - 60) % 10;
+            float fx = 0.08f + spot * 0.21f;
+            mx = g_testSheetBtnA.x + (g_testSheetBtnB.x - g_testSheetBtnA.x) * fx;
+            my = g_testSheetBtnA.y + (g_testSheetBtnB.y - g_testSheetBtnA.y) * 0.25f;
+            lmb = t >= 2 && t <= 4;
+        }
+        if ((ph == 46 || ph == 48 || ph == 49) && k == 120) Log("test: sheet button clicks landed %d of 5", g_testSheetClicks);
         if (ph == 33 && k == 200) Log("test: 140 frames after tapping Take photo: photo state %d", Photo_State());
         if (ph == 30 && k == 200) Log("test: settings scroll after dragging up %.0f, wallpaper %d (should be unchanged)", g_testSettingsScroll, g_testWallpaperNow);
         if (ph == 0 && k == 199) Log("test: phone at %.0f,%.0f before drag", g_testPhonePos.x, g_testPhonePos.y);
