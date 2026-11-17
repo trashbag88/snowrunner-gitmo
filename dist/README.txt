@@ -1,5 +1,5 @@
 ===============================================================================
-  Gitmo for SnowRunner  v0.9.13 (transfers, text messages, photos and radio)
+  Gitmo for SnowRunner  v0.9.14 (transfers, text messages, photos and radio)
 ===============================================================================
 
 WHAT IT IS
@@ -220,6 +220,12 @@ transfer is still "settling" on the Send screen.)
 
 VERSION HISTORY
 ---------------
+  0.9.14 Players who stop hearing each other reconnect by themselves: if a
+         friend's Gitmo goes quiet for 30 s while they're still playing,
+         Gitmo restarts the Steam connection to them. Looking up who is in
+         your game now runs on its own, so a slow answer from the game can't
+         hold up messages. The log now says when a player goes offline and
+         notes it if Gitmo's networking ever gets stuck.
   0.9.13 A big reliability pass by RJArkell: stricter checks on messages and
          saved files, transfers that can't be saved are rolled back instead
          of risking a double payment, safer photo/radio/VR handling, and a

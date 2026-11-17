@@ -22,6 +22,7 @@
 #include <set>
 #include <regex>
 #include <cctype>
+#include <climits>
 
 std::atomic<int> g_txWaiting{0};
 std::atomic<int> g_smsUnread{0};
@@ -58,6 +59,8 @@ using ImgRGBA_t    = bool (__cdecl*)(void*, int, uint8_t*, int);
 using ReqUser_t    = bool (__cdecl*)(void*, uint64_t, bool);
 using HasFriend_t  = bool (__cdecl*)(void*, uint64_t, int);
 using WriteShot_t  = uint32_t (__cdecl*)(void*, void*, uint32_t, int, int);   // ISteamScreenshots::WriteScreenshot (24-bit RGB)
+using CloseSes_t   = bool (__cdecl*)(void*, const Identity*);
+using SesInfo_t    = int (__cdecl*)(void*, const Identity*, void*, void*);    // -> ESteamNetworkingConnectionState
 
 struct Api {
     void *user = nullptr, *friends = nullptr, *nm = nullptr, *utils = nullptr;
@@ -68,6 +71,7 @@ struct Api {
     HasFriend_t hasFriend; Rp_t rp;
     Avatar_t mediumAvatar; ImgSize_t imgSize; ImgRGBA_t imgRGBA; ReqUser_t requestUser;
     void* screenshots = nullptr; WriteShot_t writeShot;
+    CloseSes_t closeSession; SesInfo_t sessionInfo;     // optional
 } S;
 
 std::mutex g_mx;                 // guards g_eng, g_sms, and g_status
@@ -118,6 +122,8 @@ bool Resolve(HMODULE sa) {
     S.imgRGBA        = Get<ImgRGBA_t>(sa, "SteamAPI_ISteamUtils_GetImageRGBA");
     S.requestUser    = Get<ReqUser_t>(sa, "SteamAPI_ISteamFriends_RequestUserInformation");
     S.writeShot      = Get<WriteShot_t>(sa, "SteamAPI_ISteamScreenshots_WriteScreenshot");
+    S.closeSession   = Get<CloseSes_t>(sa, "SteamAPI_ISteamNetworkingMessages_CloseSessionWithUser");
+    S.sessionInfo    = Get<SesInfo_t>(sa, "SteamAPI_ISteamNetworkingMessages_GetSessionConnectionInfo");
     return S.getSteamID && S.friendCount && S.friendByIndex && S.friendGame && S.friendName &&
            S.idClear && S.idSet && S.idGet && S.sendTo && S.receive && S.acceptSession && S.release && S.registerCallback;
 }
@@ -152,6 +158,38 @@ int GuardedSend(uint64_t to, const std::string& m) {
         Identity id; MakeId(id, to);
         return S.sendTo(S.nm, &id, m.data(), (uint32_t)m.size(), kSendReliable, kChannel);
     } __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+
+// The Steam connection to a player (ESteamNetworkingConnectionState), INT_MIN when unknown.
+int GuardedSessionState(uint64_t peer) {
+    if (!peer || !S.sessionInfo) return INT_MIN;
+    __try {
+        Identity id; MakeId(id, peer);
+        alignas(8) uint8_t info[4096] = {};    // SteamNetConnectionInfo_t (well over its size)
+        alignas(8) uint8_t quick[2048] = {};   // SteamNetConnectionRealTimeStatus_t
+        return S.sessionInfo(S.nm, &id, info, quick);
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return INT_MIN; }
+}
+const char* SessionStateName(int s) {
+    switch (s) {
+    case 0: return "none";
+    case 1: return "connecting";
+    case 2: return "finding a route";
+    case 3: return "connected";
+    case 4: return "closed by the other player";
+    case 5: return "a problem on this side";
+    case -1: case -2: return "closing";
+    case -3: return "dead";
+    default: return "unknown";
+    }
+}
+// Drops our Steam connection to a player; the next message opens a fresh one.
+bool GuardedCloseSession(uint64_t peer) {
+    if (!peer || !S.closeSession) return false;
+    __try {
+        Identity id; MakeId(id, peer);
+        return S.closeSession(S.nm, &id);
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
 
 struct RawMsg { uint64_t from; std::string data; };
@@ -538,6 +576,62 @@ HySession ReadHydra() {
     return r;
 }
 
+// ---- the game session, read on its own thread ----------------------------------------------
+// The lookup calls into the game's online SDK, which could stall (say, during a map change).
+// On its own thread that can't stop Gitmo's Steam messages; the network loop just uses the
+// latest reading. This thread in turn watches the network loop and logs if it stops moving.
+const ULONGLONG kStuckMs = 20000;
+std::mutex g_hsMx;
+HySession g_hs;                              // latest reading (g_hsMx)
+ULONGLONG g_hsAt = 0;                        // when it was taken, 0 = not yet (g_hsMx)
+std::atomic<ULONGLONG> g_hsCallSince{0};     // a lookup running since (0 = none)
+std::atomic<ULONGLONG> g_netBeat{0};         // the network loop's latest pass
+std::atomic<int> g_netStage{0};
+const char* NetStageName(int s) {
+    static const char* names[] = { "waiting", "reading messages", "Steam pictures", "Steam friends",
+                                   "player list", "saying hello", "SMS contacts", "handling messages" };
+    return s >= 0 && s < (int)(sizeof(names) / sizeof(names[0])) ? names[s] : "?";
+}
+
+DWORD WINAPI SessionThread(LPVOID) {
+    std::string lastSession = "-";
+    bool netStuck = false;
+    for (;;) {
+        g_hsCallSince = GetTickCount64();
+        HySession hs = ReadHydra();
+        g_hsCallSince = 0;
+        std::string sig = hs.ok ? hs.id : "?";
+        for (auto& m : hs.members) sig += "," + m.hydra;
+        if (sig != lastSession) {
+            if (!hs.ok) Log("session: can't read the game session yet");
+            else if (hs.id.empty()) Log("session: not in a game session (main menu or offline)");
+            else {
+                std::string who;
+                for (auto& m : hs.members)
+                    who += (who.empty() ? "" : ", ") + (m.steam == g_me ? std::string("you") :
+                           !m.nick.empty() ? m.nick : m.steam ? std::to_string(m.steam) : m.hydra);
+                Log("session: game session %s, %zu player(s): %s", hs.id.c_str(), hs.members.size(), who.c_str());
+            }
+            lastSession = sig;
+        }
+        {
+            std::lock_guard<std::mutex> lk(g_hsMx);
+            g_hs = std::move(hs);
+            g_hsAt = GetTickCount64();
+        }
+        ULONGLONG beat = g_netBeat, now = GetTickCount64();
+        if (beat && now > beat && now - beat > kStuckMs) {
+            if (!netStuck) Log("transfers: Gitmo's network loop hasn't moved for %llu s (at: %s) - no Gitmo messages go out or come in",
+                               (now - beat) / 1000, NetStageName(g_netStage));
+            netStuck = true;
+        } else if (netStuck && beat) {
+            Log("transfers: Gitmo's network loop is running again");
+            netStuck = false;
+        }
+        Sleep((DWORD)tx::kHelloEvery);
+    }
+}
+
 // ---- incoming session requests -----------------------------------------------------------
 // Steam asks before delivering messages from someone we haven't messaged yet. Accept only
 // players we know: friends in SnowRunner and our lobby. Laid out like the SDK's CCallbackBase.
@@ -894,13 +988,30 @@ DWORD WINAPI NetThread(LPVOID) {
         g_txVersion.fetch_add(1, std::memory_order_release);
     }
 
+    if (HANDLE t = CreateThread(nullptr, 0, SessionThread, nullptr, 0, nullptr)) CloseHandle(t);
+    else Log("session: couldn't start the session thread -> transfers go to every friend in SnowRunner");
+
     ULONGLONG nextFind = 0;
     int lastFriends = -1;
-    std::string lastSession = "-";
+    bool sessionStuck = false;
+    std::map<uint64_t, std::string> wasOnline;          // Gitmo players online at the last round
+    struct Reset { ULONGLONG next = 0, wait = 0; int tries = 0; };
+    std::map<uint64_t, Reset> resets;                    // silent players whose Steam connection we restart
+    const ULONGLONG kSilentReset = 30000;                // restart after this long without a Gitmo message
+    const ULONGLONG kResetWaitFirst = 60000, kResetWaitMax = 600000;
+    const int kResetTries = 6;
+    ULONGLONG resumedAt = 0;      // this loop was held up until then: silence since is ours, not theirs
     RawMsg in[32];
     bool receiveWarning = false;
     for (;;) {
+        g_netStage = 0;
         Sleep(50);
+        {
+            ULONGLONG t = GetTickCount64(), prev = g_netBeat;
+            if (prev && t > prev && t - prev > tx::kHelloEvery) resumedAt = t;
+            g_netBeat = t;
+        }
+        g_netStage = 1;
         int n = GuardedReceive(in, 32);
         if (n < 0) {
             if (!receiveWarning) Log("transfers: Steam message receive failed");
@@ -912,33 +1023,29 @@ DWORD WINAPI NetThread(LPVOID) {
         }
         ULONGLONG now = GetTickCount64();
         static ULONGLONG nextAvatars;
+        g_netStage = 2;
         if (now >= nextAvatars) { nextAvatars = now + 1000; FetchAvatars(); }   // Steam pictures for SMS contacts
         if (now >= nextFind) {   // who could we send to?
             nextFind = now + tx::kHelloEvery;
-            // 1. our game session, from the game's own online SDK
-            HySession hs = ReadHydra();
-            {
-                std::string sig = hs.ok ? hs.id : "?";
-                for (auto& m : hs.members) sig += "," + m.hydra;
-                if (sig != lastSession) {
-                    if (!hs.ok) Log("session: can't read the game session yet");
-                    else if (hs.id.empty()) Log("session: not in a game session (main menu or offline)");
-                    else {
-                        std::string who;
-                        for (auto& m : hs.members)
-                            who += (who.empty() ? "" : ", ") + (m.steam == g_me ? std::string("you") :
-                                   !m.nick.empty() ? m.nick : m.steam ? std::to_string(m.steam) : m.hydra);
-                        Log("session: game session %s, %zu player(s): %s", hs.id.c_str(), hs.members.size(), who.c_str());
-                    }
-                    lastSession = sig;
-                }
+            // 1. our game session: the session thread's latest reading of the game's online SDK
+            HySession hs;
+            ULONGLONG hsAt;
+            { std::lock_guard<std::mutex> hl(g_hsMx); hs = g_hs; hsAt = g_hsAt; }
+            ULONGLONG since = g_hsCallSince;
+            bool stuck = since && now > since && now - since > kStuckMs;
+            if (stuck != sessionStuck) {
+                if (stuck) Log("session: the game's session lookup hasn't answered for %llu s -> carrying on without it (all friends in SnowRunner count)", (now - since) / 1000);
+                else Log("session: the game's session lookup answered again");
+                sessionStuck = stuck;
             }
+            if (stuck || !hsAt) hs = HySession();   // not known right now
             auto inSession = [&](const std::string& hydra, uint64_t steam) {
                 for (auto& m : hs.members) if ((!hydra.empty() && m.hydra == hydra) || (steam && m.steam == steam)) return true;
                 return false;
             };
 
             // 2. who could we send to: friends in SnowRunner, Steam players in our session, Gitmo players we hear from
+            g_netStage = 3;
             std::vector<FriendInfo> fr;
             GuardedFriends(fr);
             if ((int)fr.size() != lastFriends) { Log("transfers: %zu friend(s) playing SnowRunner", fr.size()); lastFriends = (int)fr.size(); }
@@ -956,6 +1063,20 @@ DWORD WINAPI NetThread(LPVOID) {
             std::vector<tx::Peer> onlinePeers;
             { std::lock_guard<std::mutex> lk(g_mx); onlinePeers = g_eng->OnlinePeersAll(); }
             for (auto& p : onlinePeers) add(p.id, p.name, GuardedHasFriend(p.id));
+            {   // who went quiet since the last round (16 s without a Gitmo message)
+                std::map<uint64_t, std::string> nowOnline;
+                for (auto& p : onlinePeers) nowOnline[p.id] = p.name;
+                bool justResumed = resumedAt && now - resumedAt < tx::kOnline;   // their messages are still queued
+                for (auto& kv : wasOnline)
+                    if (!justResumed && !nowOnline.count(kv.first)) {
+                        std::string name = !kv.second.empty() ? kv.second : GuardedName(kv.first);
+                        if (name.empty()) name = std::to_string(kv.first);
+                        Log("transfers: %s went offline (no Gitmo message for %llu s; Steam connection: %s)",
+                            name.c_str(), (unsigned long long)(tx::kOnline / 1000), SessionStateName(GuardedSessionState(kv.first)));
+                    }
+                wasOnline.swap(nowOnline);
+            }
+            g_netStage = 4;
             if (g_cfg.sessionResearch >= 2) {
                 std::lock_guard<std::mutex> lk(g_cbMx);
                 g_probePlayers.clear();
@@ -970,12 +1091,46 @@ DWORD WINAPI NetThread(LPVOID) {
                 if (c.isFriend || direct) seen.push_back({ c.id, c.name, direct });
             }
 
+            // 3. a player whose Gitmo we heard earlier, still playing (or in our session), but silent
+            //    for a while: restart the Steam connection to them, in case it broke without an error
+            g_netStage = 5;
+            {
+                struct Silent { uint64_t id; std::string name; ULONGLONG ms; };
+                std::vector<Silent> silent;
+                if (!resumedAt || now - resumedAt > kSilentReset) {
+                    std::lock_guard<std::mutex> lk(g_mx);
+                    for (auto& x : seen) {
+                        uint64_t h = g_eng->LastHeard(x.id);
+                        if (h && now > h && now - h > kSilentReset) silent.push_back({ x.id, x.name, now - h });
+                    }
+                }
+                std::set<uint64_t> silentIds;
+                for (auto& s : silent) {
+                    silentIds.insert(s.id);
+                    Reset& r = resets[s.id];
+                    if (r.tries >= kResetTries || now < r.next) continue;
+                    std::string name = !s.name.empty() ? s.name : std::to_string(s.id);
+                    int state = GuardedSessionState(s.id);
+                    bool closed = GuardedCloseSession(s.id);
+                    r.wait = r.wait ? (std::min)(r.wait * 2, kResetWaitMax) : kResetWaitFirst;
+                    r.next = now + r.wait;
+                    r.tries++;
+                    Log("transfers: nothing from %s's Gitmo for %llu s, though they're still playing -> restarting the Steam connection to them (it was: %s)%s",
+                        name.c_str(), s.ms / 1000, SessionStateName(state), closed ? "" : " - Steam didn't close it");
+                    if (r.tries >= kResetTries)
+                        Log("transfers: %s: no answer after %d restarts; stopped restarting (Gitmo keeps saying hello)", name.c_str(), r.tries);
+                }
+                for (auto it = resets.begin(); it != resets.end();)   // heard again, or gone: start over next time
+                    it = silentIds.count(it->first) ? std::next(it) : resets.erase(it);
+            }
+
             std::lock_guard<std::mutex> lk(g_mx);
             // Can't read the session (the game changed)? Then fall back to every friend in SnowRunner.
             g_eng->SetSessionOnly(g_cfg.sessionOnly && hs.ok);
             g_eng->SetMySession(hs.id);
             for (auto& x : seen) g_eng->SetPeer(x.id, x.name, x.direct);
             for (auto& x : seen) g_eng->SayHello(x.id);
+            g_netStage = 6;
             // SMS contacts: everyone with Gitmo who is online now, plus everyone written with before
             std::vector<uint64_t> avatars;
             {
@@ -995,6 +1150,7 @@ DWORD WINAPI NetThread(LPVOID) {
                 for (uint64_t id : avatars) if (!g_avWanted.count(id)) g_avWanted[id] = 0;
             }
         }
+        g_netStage = 7;
         std::lock_guard<std::mutex> lk(g_mx);
         for (int i = 0; i < n; i++) {
             if (in[i].data.empty()) continue;

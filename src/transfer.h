@@ -119,6 +119,10 @@ public:
     bool InGame(uint64_t peer) const;
     void SayHello(uint64_t peer);
     bool Knows(uint64_t peer) const { return peers_.count(peer) != 0; }   // a friend in the game or in our lobby
+    uint64_t LastHeard(uint64_t peer) const {      // when their Gitmo last messaged us (0 = not this run)
+        auto it = peers_.find(peer);
+        return it != peers_.end() && it->second.hasGitmo ? it->second.lastSeen : 0;
+    }
     void OnMessage(uint64_t from, const std::string& msg);
     void Tick();
 
